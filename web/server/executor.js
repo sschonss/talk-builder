@@ -145,17 +145,23 @@ function applyAction(action, slides, llmOutput) {
 
 const NO_LLM = new Set(['remove_slide', 'move_slide'])
 
+function estTokens(text) {
+  if (!text) return 0
+  return Math.ceil(String(text).length / 4)
+}
+
 export async function executeAction({ slides, action, cfg, onAttempt }) {
   if (NO_LLM.has(action.type)) {
     applyAction(action, slides, null)
-    return { ok: true, slides, llm_text: null }
+    return { ok: true, slides, llm_text: null, tokens_in: 0, tokens_out: 0 }
   }
 
   let lastError = null
   let lastRaw = null
+  let prompt = ''
   for (let attempt = 1; attempt <= 2; attempt++) {
     if (onAttempt) onAttempt(attempt)
-    let prompt = buildPromptForAction(action, slides)
+    prompt = buildPromptForAction(action, slides)
     if (attempt > 1 && lastError) {
       prompt += `\n\nSua tentativa anterior falhou com este erro:\n${lastError}\n\nRaw output anterior (primeiros 800 chars):\n${(lastRaw || '').slice(0, 800)}\n\nCorrija o JSON e tente de novo.`
     }
@@ -165,10 +171,10 @@ export async function executeAction({ slides, action, cfg, onAttempt }) {
       const json = extractJson(reply)
       if (!json) { lastError = 'LLM não devolveu JSON válido'; continue }
       applyAction(action, slides, json)
-      return { ok: true, slides, llm_text: reply }
+      return { ok: true, slides, llm_text: reply, tokens_in: estTokens(prompt), tokens_out: estTokens(reply) }
     } catch (e) {
       lastError = e.message
     }
   }
-  return { ok: false, error: lastError, raw: lastRaw }
+  return { ok: false, error: lastError, raw: lastRaw, tokens_in: estTokens(prompt), tokens_out: estTokens(lastRaw) }
 }

@@ -181,6 +181,90 @@ async function openTalk(slug) {
   selectedIndex.value = 0
   await nextTick(scrollBottom)
   loadSimilar(slug)
+  await reconnectPlanIfAny(slug)
+  await refreshContextStats(slug)
+}
+
+async function reconnectPlanIfAny(slug) {
+  try {
+    const r = await api(`/api/talks/${slug}/plan/state`)
+    if (!r.active) return
+    const st = r.state
+    const msg = messages.value.find(m => m.kind === 'plan' && m.plan === st.plan) || messages.value.slice().reverse().find(m => m.kind === 'plan' && st.msgIndex != null && messages.value.indexOf(m) === st.msgIndex)
+    const target = msg || reactive({
+      role: 'assistant', kind: 'plan', plan: st.plan, status: st.status,
+      progress: st.progress || {}, tokens: st.tokens || { in: 0, out: 0 },
+      userPrompt: st.userPrompt, ts: Date.now(),
+    })
+    if (!msg) messages.value.push(target)
+    target.plan = st.plan
+    target.progress = st.progress || {}
+    target.tokens = st.tokens || { in: 0, out: 0 }
+    target.userPrompt = st.userPrompt
+    target.status = st.status
+    if (st.status === 'running') {
+      sending.value = true
+      streamPlanUpdates(slug, target)
+    }
+  } catch {}
+}
+
+function streamPlanUpdates(slug, target) {
+  sseRequestGet(`/api/talks/${slug}/plan/stream`, {
+    snapshot: (d) => {
+      target.plan = d.plan
+      target.progress = d.progress || {}
+      target.tokens = d.tokens || { in: 0, out: 0 }
+      target.status = d.status
+    },
+    action_start: (d) => { target.currentIndex = d.i; target.progress[d.i] = { ...(target.progress[d.i] || {}), status: 'running', attempt: 1 } },
+    action_attempt: (d) => { target.progress[d.i] = { ...(target.progress[d.i] || {}), attempt: d.attempt } },
+    action_done: (d) => {
+      target.progress[d.i] = { status: 'done', elapsed_ms: d.elapsed_ms, tokens_in: d.tokens_in, tokens_out: d.tokens_out, attempt: target.progress[d.i]?.attempt || 1 }
+      if (d.tokens_total) target.tokens = d.tokens_total
+    },
+    action_error: (d) => {
+      target.progress[d.i] = { status: 'error', error: d.error }
+      target.status = 'error'; target.errorMsg = `Ação ${d.i}: ${d.error}`
+      sending.value = false
+    },
+    cancelled: () => { target.status = 'cancelled'; sending.value = false },
+    all_done: (d) => {
+      target.status = d.status || 'done'
+      if (d.tokens) target.tokens = d.tokens
+      if (d.slides) slides.value = d.slides
+      if (d.slides_mtime) slidesMtime.value = d.slides_mtime
+      sending.value = false
+      refreshContextStats(slug)
+    },
+    no_plan: () => { sending.value = false },
+  })
+}
+
+async function sseRequestGet(url, handlers) {
+  try {
+    const r = await fetch(url)
+    if (!r.ok || !r.body) return
+    const reader = r.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const events = buf.split('\n\n'); buf = events.pop()
+      for (const ev of events) {
+        let name = 'message', data = ''
+        for (const line of ev.split('\n')) {
+          if (line.startsWith('event: ')) name = line.slice(7)
+          else if (line.startsWith('data: ')) data += line.slice(6)
+        }
+        let parsed = {}
+        try { parsed = JSON.parse(data) } catch {}
+        handlers[name]?.(parsed)
+      }
+    }
+  } catch {}
 }
 
 async function createTalk() {
@@ -268,6 +352,38 @@ async function sseRequest(url, body, handlers) {
 }
 
 const autoExecuteSession = ref(false)
+const ctxStats = ref(null)
+const ctxModalOpen = ref(false)
+const compacting = ref(false)
+
+async function refreshContextStats(slug) {
+  if (!slug) { ctxStats.value = null; return }
+  try { ctxStats.value = await api(`/api/talks/${slug}/context-stats`) } catch { ctxStats.value = null }
+}
+
+function fmtTok(n) {
+  if (n == null) return '-'
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
+async function compactChat() {
+  if (!currentSlug.value) return
+  if (!confirm('Compactar todas as mensagens antigas em um único resumo? As 4 mais recentes são preservadas. Isso reescreve chat.json.')) return
+  compacting.value = true
+  try {
+    const r = await api(`/api/talks/${currentSlug.value}/chat/compact`, { method: 'POST', body: { keep_last: 4 } })
+    if (r.skipped) { error.value = r.reason; return }
+    const data = await api(`/api/talks/${currentSlug.value}`)
+    messages.value = data.messages || []
+    await refreshContextStats(currentSlug.value)
+    ctxModalOpen.value = false
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    compacting.value = false
+  }
+}
 
 function shouldUsePlanner() {
   const mode = settings.value?.edit_mode || 'auto'
@@ -355,11 +471,6 @@ async function runClassicFlow(content) {
 }
 
 async function runPlannerFlow(content) {
-  const planMsg = reactive({
-    role: 'assistant', kind: 'plan', plan: null, status: 'planning',
-    content: 'Planejando ações...', ts: Date.now(), userPrompt: content, progress: {},
-  })
-  messages.value.push(planMsg)
   let r
   try {
     r = await fetch(`/api/talks/${currentSlug.value}/plan`, {
@@ -368,20 +479,21 @@ async function runPlannerFlow(content) {
       body: JSON.stringify({ content }),
     })
   } catch (e) {
-    planMsg.status = 'error'
-    planMsg.errorMsg = `Falha de rede: ${e.message}`
+    error.value = `Falha de rede: ${e.message}`
     return
   }
   if (!r.ok) {
     const body = await r.json().catch(() => ({}))
-    planMsg.status = 'error'
-    planMsg.errorMsg = `Planner falhou: ${body.error || r.statusText}`
+    error.value = `Planner falhou: ${body.error || r.statusText}`
     return
   }
   const data = await r.json()
-  planMsg.plan = data.plan
-  planMsg.content = ''
-  planMsg.status = 'awaiting'
+  const fresh = await api(`/api/talks/${currentSlug.value}`)
+  messages.value = fresh.messages || []
+  const planMsg = reactive(messages.value[messages.value.length - 1])
+  messages.value[messages.value.length - 1] = planMsg
+  planMsg.userPrompt = content
+  await nextTick(scrollBottom)
 
   if (autoExecuteSession.value && !hasDestructive(data.plan)) {
     await executePlan(planMsg)
@@ -389,6 +501,7 @@ async function runPlannerFlow(content) {
 }
 
 function cancelPlan(m) {
+  fetch(`/api/talks/${currentSlug.value}/plan/cancel`, { method: 'POST' }).catch(() => {})
   m.status = 'cancelled'
   m.content = 'Plano cancelado.'
 }
@@ -398,6 +511,7 @@ async function executePlan(m) {
   m.status = 'running'
   m.errorMsg = ''
   m.progress = m.progress || {}
+  m.tokens = m.tokens || { in: 0, out: 0 }
   m.currentIndex = 0
   sending.value = true
   try {
@@ -414,7 +528,12 @@ async function executePlan(m) {
         m.progress[d.i].attempt = d.attempt
       },
       action_done: (d) => {
-        m.progress[d.i] = { status: 'done', elapsed_ms: d.elapsed_ms }
+        m.progress[d.i] = {
+          status: 'done', elapsed_ms: d.elapsed_ms,
+          tokens_in: d.tokens_in, tokens_out: d.tokens_out,
+          attempt: m.progress[d.i]?.attempt || 1,
+        }
+        if (d.tokens_total) m.tokens = d.tokens_total
       },
       action_error: (d) => {
         m.progress[d.i] = { status: 'error', error: d.error }
@@ -422,10 +541,13 @@ async function executePlan(m) {
         m.status = 'error'
         m.errorMsg = `Ação ${d.i} falhou: ${d.error}`
       },
+      cancelled: () => { m.status = 'cancelled' },
       all_done: (d) => {
         if (d.slides) slides.value = d.slides
         if (d.slides_mtime) slidesMtime.value = d.slides_mtime
-        if (m.status !== 'error') m.status = 'done'
+        if (d.tokens) m.tokens = d.tokens
+        if (m.status !== 'error' && m.status !== 'cancelled') m.status = d.status || 'done'
+        refreshContextStats(currentSlug.value)
       },
       error: (d) => {
         m.status = 'error'
@@ -677,6 +799,9 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
           <button @click="openInKeynote" :disabled="opening || !slideCount">
             {{ opening ? '...' : 'Abrir Keynote' }}
           </button>
+          <button v-if="currentSlug" class="ctx-badge" @click="ctxModalOpen = true" :title="'Contexto estimado por turno'">
+            ctx {{ ctxStats ? fmtTok(ctxStats.classic_prompt_tokens_est) : '-' }}
+          </button>
         </div>
       </header>
 
@@ -695,8 +820,14 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
                 <span class="pa-type">{{ a.type }}</span>
                 <span class="pa-desc">{{ describeAction(a) }}</span>
                 <span class="pa-status">{{ progressLabel(m, ai) }}</span>
+                <span class="pa-tokens" v-if="m.progress?.[ai]?.tokens_in != null">
+                  {{ fmtTok(m.progress[ai].tokens_in) }}↑ {{ fmtTok(m.progress[ai].tokens_out) }}↓
+                </span>
               </li>
             </ol>
+            <div v-if="m.tokens && (m.tokens.in || m.tokens.out)" class="plan-totals">
+              total: {{ fmtTok(m.tokens.in) }} tokens entrada · {{ fmtTok(m.tokens.out) }} saída
+            </div>
             <div v-if="m.status === 'awaiting'" class="plan-controls">
               <label class="auto-toggle">
                 <input type="checkbox" v-model="autoExecuteSession" />
@@ -902,6 +1033,38 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
         <p>O talk-chat conversa com o LLM configurado pra montar seu slides.json e gerar o pptx no clique de um botão.</p>
       </div>
     </section>
+
+    <div v-if="ctxModalOpen" class="modal-backdrop" @click.self="ctxModalOpen = false">
+      <div class="modal">
+        <header><h3>Contexto</h3></header>
+        <div class="modal-body" v-if="ctxStats">
+          <p style="margin: 0 0 8px; color: var(--muted); font-size: 12px;">
+            Estimativas em tokens (≈ chars / 4). Provedores CLI não reportam tokens reais.
+          </p>
+          <table class="ctx-table">
+            <tr><td>Mensagens no chat</td><td>{{ ctxStats.chat_messages }}</td></tr>
+            <tr><td>Chars do chat</td><td>{{ ctxStats.chat_chars.toLocaleString() }}</td></tr>
+            <tr><td>~tokens chat</td><td>{{ fmtTok(ctxStats.chat_tokens_est) }}</td></tr>
+            <tr><td>Slides</td><td>{{ ctxStats.slides_count }}</td></tr>
+            <tr><td>~tokens slides.json</td><td>{{ fmtTok(ctxStats.slides_json_tokens_est) }}</td></tr>
+            <tr><td>~tokens resumo do deck</td><td>{{ fmtTok(ctxStats.summary_tokens_est) }}</td></tr>
+            <tr class="hi"><td>Prompt clássico (por turno)</td><td>{{ fmtTok(ctxStats.classic_prompt_tokens_est) }}</td></tr>
+            <tr class="hi"><td>Prompt planner (por turno)</td><td>{{ fmtTok(ctxStats.planner_prompt_tokens_est) }}</td></tr>
+          </table>
+          <p style="margin: 12px 0 6px; color: var(--muted); font-size: 12px;">
+            Compactar resume todas as mensagens em um único parágrafo de "system", preservando as 4 mais recentes intactas.
+          </p>
+        </div>
+        <footer>
+          <div class="footer-btns">
+            <button @click="ctxModalOpen = false">Fechar</button>
+            <button class="primary" :disabled="compacting" @click="compactChat">
+              {{ compacting ? 'Resumindo...' : 'Compactar chat' }}
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
 
     <div v-if="settingsOpen" class="modal-backdrop" @click.self="settingsOpen = false">
       <div class="modal">
@@ -1256,4 +1419,12 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
 .plan-controls .warn { font-size: 11px; color: #e6c97a; margin: 0; }
 .auto-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .auto-toggle input { margin: 0; }
+.pa-tokens { grid-column: 1 / -1; text-align: right; font-family: Menlo, monospace; font-size: 10px; color: var(--muted); }
+.plan-totals { margin-top: 6px; font-size: 11px; font-family: Menlo, monospace; color: var(--muted); text-align: right; }
+.ctx-badge { background: transparent; border: 1px solid var(--border); color: var(--muted); font-family: Menlo, monospace; font-size: 11px; padding: 2px 8px; border-radius: 999px; cursor: pointer; }
+.ctx-badge:hover { color: var(--text); border-color: var(--text); }
+.ctx-table { width: 100%; font-size: 13px; border-collapse: collapse; }
+.ctx-table td { padding: 4px 6px; border-bottom: 1px dashed var(--border); }
+.ctx-table td:last-child { text-align: right; font-family: Menlo, monospace; color: var(--text); }
+.ctx-table tr.hi td { color: var(--text); font-weight: 600; }
 </style>

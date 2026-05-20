@@ -588,55 +588,148 @@ app.post('/api/talks/:slug/plan', async (req, res) => {
   const similarContext = await buildSimilarContext(slug, content).catch(() => '')
   try {
     const { planActions } = await import('./planner.js')
+    const { setPlan, estimateTokens } = await import('./plans.js')
     const result = await planActions({ slides, userPrompt: content, chatHistory, similarContext, cfg })
     if (!result.ok) return res.status(422).json({ error: result.error, raw: result.raw })
-    res.json({ plan: result.plan, raw: result.raw })
+
+    const state = setPlan(slug, result.plan, content)
+    state.tokens.in = estimateTokens(result.raw ? result.raw.length * 0 : 0)
+
+    const history = loadChat(slug)
+    history.push({
+      role: 'user', content, ts: Date.now(),
+    })
+    const msgIndex = history.length
+    history.push({
+      role: 'assistant', kind: 'plan', plan: result.plan, status: 'awaiting',
+      progress: {}, tokens: { in: 0, out: 0 }, userPrompt: content, ts: Date.now(),
+    })
+    state.msgIndex = msgIndex
+    saveChat(slug, history)
+
+    res.json({ plan: result.plan, raw: result.raw, msg_index: msgIndex })
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) })
   }
 })
 
+app.get('/api/talks/:slug/plan/state', async (req, res) => {
+  const { getPlan } = await import('./plans.js')
+  const s = getPlan(req.params.slug)
+  if (!s) return res.json({ active: false })
+  const { listeners, ...rest } = s
+  res.json({ active: true, state: rest })
+})
+
+app.post('/api/talks/:slug/plan/cancel', async (req, res) => {
+  const { cancelPlan } = await import('./plans.js')
+  res.json({ cancelled: cancelPlan(req.params.slug) })
+})
+
+app.get('/api/talks/:slug/plan/stream', async (req, res) => {
+  const { getPlan, subscribePlan } = await import('./plans.js')
+  const s = getPlan(req.params.slug)
+  sseInit(res)
+  if (!s) {
+    sseSend(res, 'no_plan', {})
+    return res.end()
+  }
+  sseSend(res, 'snapshot', {
+    plan: s.plan, status: s.status, currentIndex: s.currentIndex,
+    progress: s.progress, tokens: s.tokens, error: s.error, userPrompt: s.userPrompt,
+  })
+  const unsub = subscribePlan(req.params.slug, (event, data) => {
+    sseSend(res, event, data)
+    if (event === 'all_done' || event === 'cancelled') {
+      setTimeout(() => { try { res.end() } catch {} }, 100)
+    }
+  })
+  res.on('close', () => { unsub() })
+})
+
 app.post('/api/talks/:slug/execute/stream', async (req, res) => {
   const { slug } = req.params
-  const { plan, user_prompt } = req.body || {}
-  if (!plan || !Array.isArray(plan.actions)) return res.status(400).json({ error: 'plan inválido' })
+  const { plan: bodyPlan } = req.body || {}
   const slides = loadSlides(slug)
   if (!slides) return res.status(404).json({ error: 'talk não encontrada' })
 
+  const { getPlan, setPlan, updatePlan, emitPlanEvent, clearPlan } = await import('./plans.js')
+  let state = getPlan(slug)
+  if (!state || (bodyPlan && bodyPlan !== state.plan)) {
+    if (bodyPlan) state = setPlan(slug, bodyPlan, req.body?.user_prompt || '')
+  }
+  if (!state) return res.status(400).json({ error: 'sem plano ativo' })
+  if (state.status === 'running') return res.status(409).json({ error: 'plano já em execução' })
+
   sseInit(res)
   const cfg = loadConfig()
-  const history = loadChat(slug)
   backupBeforeLLM(slug)
-
-  if (user_prompt) history.push({ role: 'user', content: user_prompt, ts: Date.now() })
 
   let work = JSON.parse(JSON.stringify(slides))
   let anyApplied = false
   const { executeAction } = await import('./executor.js')
 
-  sseSend(res, 'start', { total: plan.actions.length, preamble: plan.preamble })
+  updatePlan(slug, { status: 'running', cancelled: false, error: null })
+  const startEv = { total: state.plan.actions.length, preamble: state.plan.preamble }
+  sseSend(res, 'start', startEv)
+  emitPlanEvent(slug, 'start', startEv)
 
-  for (let i = 0; i < plan.actions.length; i++) {
-    const action = plan.actions[i]
+  let clientClosed = false
+  res.on('close', () => { clientClosed = true })
+
+  for (let i = 0; i < state.plan.actions.length; i++) {
+    if (state.cancelled) {
+      sseSend(res, 'cancelled', { at: i })
+      emitPlanEvent(slug, 'cancelled', { at: i })
+      updatePlan(slug, { status: 'cancelled' })
+      break
+    }
+    const action = state.plan.actions[i]
     const t0 = Date.now()
-    sseSend(res, 'action_start', { i, action })
+    state.currentIndex = i
+    const asEv = { i, action }
+    sseSend(res, 'action_start', asEv)
+    emitPlanEvent(slug, 'action_start', asEv)
+    state.progress[i] = { status: 'running', attempt: 1 }
     try {
       const r = await executeAction({
         slides: work,
         action,
         cfg,
-        onAttempt: (n) => sseSend(res, 'action_attempt', { i, attempt: n }),
+        onAttempt: (n) => {
+          const ev = { i, attempt: n }
+          if (!clientClosed) sseSend(res, 'action_attempt', ev)
+          emitPlanEvent(slug, 'action_attempt', ev)
+          state.progress[i].attempt = n
+        },
       })
+      state.tokens.in += r.tokens_in || 0
+      state.tokens.out += r.tokens_out || 0
       if (!r.ok) {
-        sseSend(res, 'action_error', { i, error: r.error, raw: (r.raw || '').slice(0, 1000), retryable: true })
+        const ev = { i, error: r.error, raw: (r.raw || '').slice(0, 1000), retryable: true, tokens: state.tokens }
+        if (!clientClosed) sseSend(res, 'action_error', ev)
+        emitPlanEvent(slug, 'action_error', ev)
+        state.progress[i] = { status: 'error', error: r.error, attempt: state.progress[i]?.attempt || 1 }
+        updatePlan(slug, { status: 'error', error: `Ação ${i}: ${r.error}` })
         break
       }
       work = r.slides
       saveSlides(slug, work)
       anyApplied = true
-      sseSend(res, 'action_done', { i, elapsed_ms: Date.now() - t0 })
+      state.progress[i] = {
+        status: 'done', elapsed_ms: Date.now() - t0,
+        tokens_in: r.tokens_in, tokens_out: r.tokens_out,
+        attempt: state.progress[i]?.attempt || 1,
+      }
+      const adEv = { i, elapsed_ms: Date.now() - t0, tokens_in: r.tokens_in, tokens_out: r.tokens_out, tokens_total: state.tokens }
+      if (!clientClosed) sseSend(res, 'action_done', adEv)
+      emitPlanEvent(slug, 'action_done', adEv)
     } catch (e) {
-      sseSend(res, 'action_error', { i, error: String(e.message || e), retryable: true })
+      const ev = { i, error: String(e.message || e), retryable: true }
+      if (!clientClosed) sseSend(res, 'action_error', ev)
+      emitPlanEvent(slug, 'action_error', ev)
+      state.progress[i] = { status: 'error', error: String(e.message || e) }
+      updatePlan(slug, { status: 'error', error: String(e.message || e) })
       break
     }
   }
@@ -644,12 +737,71 @@ app.post('/api/talks/:slug/execute/stream', async (req, res) => {
   const slidesPath = path.join(TALKS_DIR, slug, 'slides.json')
   const slides_mtime = fs.existsSync(slidesPath) ? fs.statSync(slidesPath).mtimeMs : null
 
-  const replySummary = `Plano aplicado: ${plan.preamble}`
-  history.push({ role: 'assistant', content: replySummary, slides_updated: anyApplied, ts: Date.now(), plan })
-  saveChat(slug, history)
+  if (state.status === 'running') updatePlan(slug, { status: 'done' })
 
-  sseSend(res, 'all_done', { slides: work, slides_mtime, applied: anyApplied })
-  res.end()
+  const history = loadChat(slug)
+  if (state.msgIndex != null && history[state.msgIndex] && history[state.msgIndex].kind === 'plan') {
+    history[state.msgIndex].status = state.status
+    history[state.msgIndex].progress = state.progress
+    history[state.msgIndex].tokens = state.tokens
+    history[state.msgIndex].slides_updated = anyApplied
+    history[state.msgIndex].errorMsg = state.error || null
+    saveChat(slug, history)
+  }
+
+  const finalEv = { slides: work, slides_mtime, applied: anyApplied, status: state.status, tokens: state.tokens, error: state.error }
+  if (!clientClosed) sseSend(res, 'all_done', finalEv)
+  emitPlanEvent(slug, 'all_done', finalEv)
+
+  setTimeout(() => clearPlan(slug), 60_000)
+  if (!clientClosed) res.end()
+})
+
+app.get('/api/talks/:slug/context-stats', async (req, res) => {
+  const { slug } = req.params
+  const slides = loadSlides(slug)
+  const chat = loadChat(slug)
+  if (!slides) return res.status(404).json({ error: 'talk não encontrada' })
+  const { estimateTokens } = await import('./plans.js')
+  const tk = (chars) => Math.ceil(chars / 4)
+  const chatChars = chat.reduce((a, m) => a + String(m?.content || '').length, 0)
+  const slidesJsonChars = JSON.stringify(slides).length
+  const summaryChars = (slides.slides || []).reduce((a, s) => a + 40 + (s?.data?.title?.length || 0), 0)
+  res.json({
+    chat_messages: chat.length,
+    chat_chars: chatChars,
+    chat_tokens_est: tk(chatChars),
+    slides_count: slides.slides?.length || 0,
+    slides_json_chars: slidesJsonChars,
+    slides_json_tokens_est: tk(slidesJsonChars),
+    summary_tokens_est: tk(summaryChars),
+    classic_prompt_tokens_est: tk(chatChars + slidesJsonChars),
+    planner_prompt_tokens_est: tk(summaryChars + Math.min(chatChars, 2400)),
+  })
+})
+
+app.post('/api/talks/:slug/chat/compact', async (req, res) => {
+  const { slug } = req.params
+  const { keep_last = 4 } = req.body || {}
+  const chat = loadChat(slug)
+  if (chat.length <= keep_last + 1) return res.json({ skipped: true, reason: 'pouco contexto para compactar' })
+  const cfg = loadConfig()
+  const head = chat.slice(0, chat.length - keep_last)
+  const tail = chat.slice(chat.length - keep_last)
+  const corpus = head.map(m => `[${m.role}] ${String(m.content || '').slice(0, 1200)}`).join('\n')
+  const prompt = `Resuma o histórico de chat abaixo em um único parágrafo denso, em português, preservando: decisões tomadas, ajustes pedidos, tom do usuário, padrões recorrentes. Sem emojis. Sem preâmbulo. Devolva apenas o resumo.\n\n---\n${corpus}\n---`
+  try {
+    const summary = await runProvider(cfg.provider, prompt, cfg)
+    const clean = String(summary || '').trim().slice(0, 4000)
+    const newHistory = [
+      { role: 'system', content: `Resumo de ${head.length} mensagens anteriores: ${clean}`, ts: Date.now(), compacted: true },
+      ...tail,
+    ]
+    saveChat(slug, newHistory)
+    res.json({ ok: true, summarized: head.length, kept: tail.length, summary: clean })
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) })
+  }
 })
 
 app.post('/api/talks/:slug/open', (req, res) => {

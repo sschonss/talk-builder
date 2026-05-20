@@ -137,6 +137,26 @@ Em **Configurações → Modo de edição**:
 - Cada ação aplicada rotaciona um snapshot regular (`.history/slides-1/2/3.json`).
 - Se o planner devolver um JSON estruturalmente inválido, o endpoint retorna 422 sem tocar em nada.
 
+### Resumir / aplicar mais tarde
+
+Quando você manda um pedido em modo planner, o servidor:
+1. Salva o plano em `chat.json` como mensagem `kind: 'plan'` (status `awaiting`).
+2. Mantém o estado em memória (`server/plans.js`).
+3. Recarregar a página: `openTalk` chama `GET /plan/state`; se houver plano ativo, reconecta no `GET /plan/stream` e o cartão volta com o progresso atual.
+
+Cancelar: `POST /plan/cancel` levanta a flag — a execução para entre ações.
+
+Tokens consumidos (estimativa `chars / 4`) são reportados por ação e somados no rodapé do cartão. Provedores CLI não devolvem contagem real.
+
+### Contexto e compactação
+
+Botão `ctx Nk` no header mostra a estimativa de quanto contexto vai por turno:
+
+- **Prompt clássico** = todo o chat + slides.json completo
+- **Prompt planner** = resumo do deck + últimas 6 mensagens
+
+`POST /api/talks/:slug/chat/compact` chama o LLM pra resumir todas as mensagens menos as N mais recentes (`keep_last`, padrão 4) em uma única mensagem `system`. Útil pra decks usados há muito tempo, onde o histórico fica caro no modo clássico.
+
 ---
 
 ## Vetorização (embeddings)
