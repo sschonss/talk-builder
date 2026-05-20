@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue'
 import FidelitySlide from './FidelitySlide.vue'
 
 const talks = ref([])
@@ -116,6 +116,8 @@ async function openSettings() {
     opencode_binary: settings.value.opencode_binary,
     opencode_model: settings.value.opencode_model || '',
     llm_timeout_minutes: settings.value.llm_timeout_minutes || 30,
+    edit_mode: settings.value.edit_mode || 'auto',
+    planner_threshold: settings.value.planner_threshold || 30,
   }
   testResult.value = null
   settingsOpen.value = true
@@ -265,6 +267,43 @@ async function sseRequest(url, body, handlers) {
   pushDebug('request:done', { url, elapsed_ms: Date.now() - startedAt })
 }
 
+const autoExecuteSession = ref(false)
+
+function shouldUsePlanner() {
+  const mode = settings.value?.edit_mode || 'auto'
+  if (mode === 'classic') return false
+  if (mode === 'planner') return true
+  const threshold = settings.value?.planner_threshold || 30
+  return (slides.value?.slides?.length || 0) >= threshold
+}
+
+function describeAction(a) {
+  switch (a.type) {
+    case 'edit_slide': return `slide ${a.idx}: ${a.instruction}`
+    case 'add_slides': return `+${a.count} depois do ${a.after} sobre ${a.topic}`
+    case 'remove_slide': return `apagar slide ${a.idx}`
+    case 'move_slide': return `mover ${a.from} → ${a.to}`
+    case 'set_meta': return `meta: ${Object.keys(a.patch || {}).join(', ')}`
+    case 'bulk_edit': return `bulk: ${a.transform}`
+    case 'replace_section': return `substituir ${a.start}..${a.end}: ${a.instruction}`
+    case 'regenerate_slide': return `regenerar slide ${a.idx}: ${a.instruction}`
+    default: return a.type
+  }
+}
+
+function progressLabel(m, ai) {
+  const p = m.progress?.[ai]
+  if (!p) return ''
+  if (p.status === 'running') return `... tentativa ${p.attempt || 1}`
+  if (p.status === 'done') return `ok (${Math.round((p.elapsed_ms || 0) / 100) / 10}s)`
+  if (p.status === 'error') return `falhou`
+  return ''
+}
+
+function hasDestructive(plan) {
+  return (plan.actions || []).some(a => a.type === 'remove_slide' || a.type === 'replace_section')
+}
+
 async function send() {
   const content = input.value.trim()
   if (!content || sending.value || !currentSlug.value) return
@@ -272,37 +311,152 @@ async function send() {
   error.value = ''
   lastPrompt.value = content
   messages.value.push({ role: 'user', content, ts: Date.now() })
-  const assistantMsg = { role: 'assistant', content: '', rawStream: '', showRaw: false, ts: Date.now(), streaming: true }
-  messages.value.push(assistantMsg)
   await nextTick(scrollBottom)
   sending.value = true
+
+  const usePlanner = shouldUsePlanner()
+
   try {
-    await sseRequest(`/api/talks/${currentSlug.value}/message/stream`, { content, debug: debugMode.value }, {
-      chunk: (d) => {
-        const t = d.text || ''
-        assistantMsg.rawStream += t
-        if (showStreamInChat.value) {
-          assistantMsg.content += t
-          scrollBottom()
-        }
-      },
-      done: (d) => {
-        assistantMsg.content = d.reply || assistantMsg.content
-        assistantMsg.slides_updated = d.slides_updated
-        assistantMsg.streaming = false
-        lastResponse.value = assistantMsg.content
-        if (d.slides) slides.value = d.slides
-        if (d.slides_mtime) slidesMtime.value = d.slides_mtime
-      },
-      error: (d) => { error.value = d.error || 'Erro no stream'; assistantMsg.streaming = false },
-    })
+    if (usePlanner) {
+      await runPlannerFlow(content)
+    } else {
+      await runClassicFlow(content)
+    }
   } catch (e) {
     error.value = e.message
-    assistantMsg.streaming = false
   } finally {
     sending.value = false
     await nextTick(scrollBottom)
   }
+}
+
+async function runClassicFlow(content) {
+  const assistantMsg = { role: 'assistant', content: '', rawStream: '', showRaw: false, ts: Date.now(), streaming: true }
+  messages.value.push(assistantMsg)
+  await sseRequest(`/api/talks/${currentSlug.value}/message/stream`, { content, debug: debugMode.value }, {
+    chunk: (d) => {
+      const t = d.text || ''
+      assistantMsg.rawStream += t
+      if (showStreamInChat.value) {
+        assistantMsg.content += t
+        scrollBottom()
+      }
+    },
+    done: (d) => {
+      assistantMsg.content = d.reply || assistantMsg.content
+      assistantMsg.slides_updated = d.slides_updated
+      assistantMsg.streaming = false
+      lastResponse.value = assistantMsg.content
+      if (d.slides) slides.value = d.slides
+      if (d.slides_mtime) slidesMtime.value = d.slides_mtime
+    },
+    error: (d) => { error.value = d.error || 'Erro no stream'; assistantMsg.streaming = false },
+  })
+}
+
+async function runPlannerFlow(content) {
+  const planMsg = reactive({
+    role: 'assistant', kind: 'plan', plan: null, status: 'planning',
+    content: 'Planejando ações...', ts: Date.now(), userPrompt: content, progress: {},
+  })
+  messages.value.push(planMsg)
+  let r
+  try {
+    r = await fetch(`/api/talks/${currentSlug.value}/plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    })
+  } catch (e) {
+    planMsg.status = 'error'
+    planMsg.errorMsg = `Falha de rede: ${e.message}`
+    return
+  }
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}))
+    planMsg.status = 'error'
+    planMsg.errorMsg = `Planner falhou: ${body.error || r.statusText}`
+    return
+  }
+  const data = await r.json()
+  planMsg.plan = data.plan
+  planMsg.content = ''
+  planMsg.status = 'awaiting'
+
+  if (autoExecuteSession.value && !hasDestructive(data.plan)) {
+    await executePlan(planMsg)
+  }
+}
+
+function cancelPlan(m) {
+  m.status = 'cancelled'
+  m.content = 'Plano cancelado.'
+}
+
+async function executePlan(m) {
+  if (!m.plan) return
+  m.status = 'running'
+  m.errorMsg = ''
+  m.progress = m.progress || {}
+  m.currentIndex = 0
+  sending.value = true
+  try {
+    await sseRequest(`/api/talks/${currentSlug.value}/execute/stream`, {
+      plan: m.plan,
+      user_prompt: m.userPrompt,
+    }, {
+      action_start: (d) => {
+        m.currentIndex = d.i
+        m.progress[d.i] = { status: 'running', attempt: 1 }
+      },
+      action_attempt: (d) => {
+        if (!m.progress[d.i]) m.progress[d.i] = { status: 'running' }
+        m.progress[d.i].attempt = d.attempt
+      },
+      action_done: (d) => {
+        m.progress[d.i] = { status: 'done', elapsed_ms: d.elapsed_ms }
+      },
+      action_error: (d) => {
+        m.progress[d.i] = { status: 'error', error: d.error }
+        m.failedIndex = d.i
+        m.status = 'error'
+        m.errorMsg = `Ação ${d.i} falhou: ${d.error}`
+      },
+      all_done: (d) => {
+        if (d.slides) slides.value = d.slides
+        if (d.slides_mtime) slidesMtime.value = d.slides_mtime
+        if (m.status !== 'error') m.status = 'done'
+      },
+      error: (d) => {
+        m.status = 'error'
+        m.errorMsg = d.error || 'Erro no stream'
+      },
+    })
+  } catch (e) {
+    m.status = 'error'
+    m.errorMsg = e.message
+  } finally {
+    sending.value = false
+  }
+}
+
+async function retryFromFailed(m) {
+  if (m.failedIndex == null || !m.plan) return
+  const remaining = {
+    preamble: m.plan.preamble + ' (retomada)',
+    actions: m.plan.actions.slice(m.failedIndex),
+  }
+  const newMsg = reactive({
+    role: 'assistant', kind: 'plan', plan: remaining, status: 'awaiting',
+    content: '', ts: Date.now(), userPrompt: m.userPrompt, progress: {},
+  })
+  messages.value.push(newMsg)
+  await executePlan(newMsg)
+}
+
+async function replanFromScratch(m) {
+  input.value = m.userPrompt || ''
+  await send()
 }
 
 const buildLog = ref('')
@@ -532,7 +686,43 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
         </p>
         <div v-for="(m, i) in messages" :key="i" :class="['msg', m.role]">
           <div class="who">{{ m.role === 'user' ? 'você' : m.role === 'system' ? 'sistema' : 'copilot' }}</div>
-          <div class="text">{{ m.content }}</div>
+          <div class="text" v-if="m.content">{{ m.content }}</div>
+
+          <div v-if="m.kind === 'plan' && m.plan" class="plan-card">
+            <div class="plan-preamble">{{ m.plan.preamble }}</div>
+            <ol class="plan-actions">
+              <li v-for="(a, ai) in m.plan.actions" :key="ai" :class="['plan-action', m.progress?.[ai]?.status || 'pending']">
+                <span class="pa-type">{{ a.type }}</span>
+                <span class="pa-desc">{{ describeAction(a) }}</span>
+                <span class="pa-status">{{ progressLabel(m, ai) }}</span>
+              </li>
+            </ol>
+            <div v-if="m.status === 'awaiting'" class="plan-controls">
+              <label class="auto-toggle">
+                <input type="checkbox" v-model="autoExecuteSession" />
+                <span>Sempre executar nesta sessão</span>
+              </label>
+              <p v-if="hasDestructive(m.plan)" class="warn">Plano contém ações destrutivas — sempre pedirá confirmação.</p>
+              <div class="btn-row">
+                <button @click="cancelPlan(m)">Cancelar</button>
+                <button class="primary" @click="executePlan(m)">Executar</button>
+              </div>
+            </div>
+            <div v-else-if="m.status === 'running'" class="plan-controls">
+              <small>Executando ação {{ (m.currentIndex ?? 0) + 1 }}/{{ m.plan.actions.length }}...</small>
+            </div>
+            <div v-else-if="m.status === 'error'" class="plan-controls">
+              <p class="err">{{ m.errorMsg }}</p>
+              <div class="btn-row">
+                <button @click="retryFromFailed(m)">Tentar essa ação de novo</button>
+                <button @click="replanFromScratch(m)">Remandar prompt do zero</button>
+              </div>
+            </div>
+            <div v-else-if="m.status === 'done'" class="plan-controls ok">
+              <small>Plano aplicado.</small>
+            </div>
+          </div>
+
           <div v-if="m.slides_updated" class="badge">deck atualizado</div>
           <div v-if="m.role === 'assistant' && m.rawStream && m.rawStream !== m.content" class="raw-toggle">
             <button @click="m.showRaw = !m.showRaw" class="raw-btn">
@@ -792,6 +982,24 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
             </label>
           </fieldset>
 
+          <fieldset>
+            <legend>Modo de edição</legend>
+            <label class="field">
+              <span>Estratégia</span>
+              <select v-model="settingsDraft.edit_mode">
+                <option value="auto">Auto (planner em decks grandes)</option>
+                <option value="classic">Sempre clássico (regera o deck todo)</option>
+                <option value="planner">Sempre planner (ações pontuais)</option>
+              </select>
+              <small>Planner divide o pedido em ações pequenas. Cada ação roda separada — menos timeout, sem perder trabalho.</small>
+            </label>
+            <label class="field">
+              <span>Threshold do auto (slides)</span>
+              <input v-model.number="settingsDraft.planner_threshold" type="number" min="1" max="500" placeholder="30" />
+              <small>Em "auto", planner é usado quando o deck tem pelo menos esse número de slides.</small>
+            </label>
+          </fieldset>
+
           <p class="config-path" v-if="settings">Arquivo: {{ settings.config_path }}</p>
         </div>
         <footer>
@@ -1031,4 +1239,21 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
 .raw-btn { background: transparent; border: 0; color: var(--muted); font-size: 10px; cursor: pointer; padding: 2px 0; font-family: Menlo, monospace; }
 .raw-btn:hover { color: var(--text); }
 .raw-pre { background: #0a0a0a; border: 1px solid var(--border); padding: 8px; margin: 4px 0 0; font-family: Menlo, monospace; font-size: 10px; color: #b8e6c8; max-height: 240px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; border-radius: 4px; }
+.plan-card { margin-top: 6px; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; background: #0d0d0d; }
+.plan-preamble { font-size: 13px; margin-bottom: 8px; color: var(--text); }
+.plan-actions { list-style: none; padding: 0; margin: 0 0 8px; }
+.plan-action { display: grid; grid-template-columns: 120px 1fr auto; gap: 8px; padding: 4px 0; font-size: 12px; border-bottom: 1px dashed var(--border); align-items: baseline; }
+.plan-action:last-child { border-bottom: 0; }
+.pa-type { font-family: Menlo, monospace; font-size: 11px; color: var(--muted); }
+.pa-desc { color: var(--text); word-break: break-word; }
+.pa-status { font-size: 11px; color: var(--muted); font-family: Menlo, monospace; }
+.plan-action.running .pa-status { color: #e6c97a; }
+.plan-action.done .pa-status { color: #7ad48a; }
+.plan-action.error .pa-status { color: #e67a7a; }
+.plan-controls { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.plan-controls .btn-row { display: flex; gap: 6px; justify-content: flex-end; }
+.plan-controls.ok { color: #7ad48a; font-size: 12px; }
+.plan-controls .warn { font-size: 11px; color: #e6c97a; margin: 0; }
+.auto-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.auto-toggle input { margin: 0; }
 </style>

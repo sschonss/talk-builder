@@ -95,6 +95,50 @@ Os 3 snapshots são injetados no prompt como contexto ("Versões anteriores dest
 
 ---
 
+## Modos de edição (planner vs clássico)
+
+Decks grandes (100+ slides) sofrem com a estratégia clássica, onde o LLM regenera o `slides.json` inteiro a cada turno. Isso gera timeouts, perde trabalho parcial e força o modelo a repensar o deck todo só para mexer em 3 slides.
+
+O **planner** quebra isso: o LLM faz duas passagens, e cada passagem trabalha com pouco contexto.
+
+### Como funciona
+
+1. **Planner** (`POST /api/talks/:slug/plan`): recebe o pedido do usuário e o resumo do deck (só `idx`, `title`, `template` de cada slide). Devolve um plano com `preamble` + lista de ações:
+   - `edit_slide(idx, instruction)` — muda 1 slide
+   - `add_slides(after, count, topic, template_hint?)` — insere N novos
+   - `remove_slide(idx)` — apaga (DESTRUTIVA)
+   - `move_slide(from, to)` — reordena
+   - `set_meta(patch)` — muda título/autor/tema
+   - `bulk_edit(filter, transform)` — aplica transformação em vários (filter: `{template?, idx_range?, title_contains?}`)
+   - `replace_section(start, end, instruction)` — substitui faixa (DESTRUTIVA)
+   - `regenerate_slide(idx, instruction)` — regenera do zero
+2. **UI mostra o plano** como cartão: preâmbulo + lista de ações + botões `[Cancelar] [Executar]` e checkbox "Sempre executar nesta sessão" (apenas em memória, reseta no reload).
+3. **Executor** (`POST /api/talks/:slug/execute/stream`, SSE): roda uma ação por vez. Para ações que exigem LLM (`edit_slide`, `add_slides`, etc.), monta um prompt focado no slide afetado + vizinhos imediatos + resumo compacto do deck (sem o JSON completo). Aplica o resultado, salva snapshot, e segue.
+4. **Retry**: se uma ação falhar (JSON inválido), tenta uma segunda vez com o erro anterior anexado ao prompt. Se falhar de novo, para e mostra `[Tentar essa ação de novo] [Remandar prompt do zero]`.
+
+### Configuração
+
+Em **Configurações → Modo de edição**:
+
+| Modo | Comportamento |
+|------|---------------|
+| `auto` (padrão) | Usa planner quando o deck tem ≥ `planner_threshold` slides (padrão 30) |
+| `classic` | Sempre clássico (regenera deck inteiro) |
+| `planner` | Sempre planner |
+
+### Confirmação
+
+- Por padrão o plano sempre pede confirmação.
+- Marcando "Sempre executar nesta sessão" o plano roda automaticamente — **exceto** se contiver ações destrutivas (`remove_slide`, `replace_section`), que sempre exigem confirmação explícita.
+
+### Segurança
+
+- `backupBeforeLLM` corre antes do planner *e* antes do executor.
+- Cada ação aplicada rotaciona um snapshot regular (`.history/slides-1/2/3.json`).
+- Se o planner devolver um JSON estruturalmente inválido, o endpoint retorna 422 sem tocar em nada.
+
+---
+
 ## Vetorização (embeddings)
 
 Worker background em `server/embeddings.js` chama Ollama (`nomic-embed-text`, 768 dimensões) a cada 15s para vetorizar registros pendentes (`embedding IS NULL`). Vetores são guardados como BLOB Float32 nas colunas `chats.embedding` e `slides.embedding` do SQLite.

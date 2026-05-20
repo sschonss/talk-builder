@@ -18,6 +18,8 @@ const DEFAULTS = {
   opencode_binary: 'opencode',
   opencode_model: '',
   llm_timeout_minutes: 30,
+  edit_mode: 'auto',
+  planner_threshold: 30,
 }
 
 export function loadConfig() {

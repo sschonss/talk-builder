@@ -577,6 +577,81 @@ app.post('/api/talks/:slug/build/stream', (req, res) => {
   })
 })
 
+app.post('/api/talks/:slug/plan', async (req, res) => {
+  const { slug } = req.params
+  const { content } = req.body || {}
+  if (!content) return res.status(400).json({ error: 'content obrigatório' })
+  const slides = loadSlides(slug)
+  if (!slides) return res.status(404).json({ error: 'talk não encontrada' })
+  const cfg = loadConfig()
+  const chatHistory = loadChat(slug)
+  const similarContext = await buildSimilarContext(slug, content).catch(() => '')
+  try {
+    const { planActions } = await import('./planner.js')
+    const result = await planActions({ slides, userPrompt: content, chatHistory, similarContext, cfg })
+    if (!result.ok) return res.status(422).json({ error: result.error, raw: result.raw })
+    res.json({ plan: result.plan, raw: result.raw })
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) })
+  }
+})
+
+app.post('/api/talks/:slug/execute/stream', async (req, res) => {
+  const { slug } = req.params
+  const { plan, user_prompt } = req.body || {}
+  if (!plan || !Array.isArray(plan.actions)) return res.status(400).json({ error: 'plan inválido' })
+  const slides = loadSlides(slug)
+  if (!slides) return res.status(404).json({ error: 'talk não encontrada' })
+
+  sseInit(res)
+  const cfg = loadConfig()
+  const history = loadChat(slug)
+  backupBeforeLLM(slug)
+
+  if (user_prompt) history.push({ role: 'user', content: user_prompt, ts: Date.now() })
+
+  let work = JSON.parse(JSON.stringify(slides))
+  let anyApplied = false
+  const { executeAction } = await import('./executor.js')
+
+  sseSend(res, 'start', { total: plan.actions.length, preamble: plan.preamble })
+
+  for (let i = 0; i < plan.actions.length; i++) {
+    const action = plan.actions[i]
+    const t0 = Date.now()
+    sseSend(res, 'action_start', { i, action })
+    try {
+      const r = await executeAction({
+        slides: work,
+        action,
+        cfg,
+        onAttempt: (n) => sseSend(res, 'action_attempt', { i, attempt: n }),
+      })
+      if (!r.ok) {
+        sseSend(res, 'action_error', { i, error: r.error, raw: (r.raw || '').slice(0, 1000), retryable: true })
+        break
+      }
+      work = r.slides
+      saveSlides(slug, work)
+      anyApplied = true
+      sseSend(res, 'action_done', { i, elapsed_ms: Date.now() - t0 })
+    } catch (e) {
+      sseSend(res, 'action_error', { i, error: String(e.message || e), retryable: true })
+      break
+    }
+  }
+
+  const slidesPath = path.join(TALKS_DIR, slug, 'slides.json')
+  const slides_mtime = fs.existsSync(slidesPath) ? fs.statSync(slidesPath).mtimeMs : null
+
+  const replySummary = `Plano aplicado: ${plan.preamble}`
+  history.push({ role: 'assistant', content: replySummary, slides_updated: anyApplied, ts: Date.now(), plan })
+  saveChat(slug, history)
+
+  sseSend(res, 'all_done', { slides: work, slides_mtime, applied: anyApplied })
+  res.end()
+})
+
 app.post('/api/talks/:slug/open', (req, res) => {
   const { slug } = req.params
   const dir = path.join(TALKS_DIR, slug)
