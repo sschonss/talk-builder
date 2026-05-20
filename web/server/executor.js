@@ -255,3 +255,23 @@ export async function planActionLLM({ slides, action, cfg, onChunk, useCache = t
 }
 
 export { applyAction }
+
+export function expandBulkActions(plan, slides) {
+  const out = []
+  let expanded = false
+  for (const action of plan.actions) {
+    if (action.type !== 'bulk_edit') { out.push(action); continue }
+    const indices = filterSlides(slides, action.filter)
+    if (!indices.length) { out.push(action); continue }
+    expanded = true
+    for (const idx of indices) {
+      out.push({
+        type: 'edit_slide',
+        idx,
+        instruction: action.transform,
+        _origin: 'bulk_edit',
+      })
+    }
+  }
+  return { plan: { ...plan, actions: out }, expanded }
+}

@@ -223,6 +223,7 @@ function streamPlanUpdates(slug, target) {
       target.status = d.status
     },
     action_start: (d) => { target.currentIndex = d.i; target.progress[d.i] = { ...(target.progress[d.i] || {}), status: 'running', attempt: 1 } },
+    plan_expanded: (d) => { target.plan = d.plan; target.progress = {} },
     action_attempt: (d) => { target.progress[d.i] = { ...(target.progress[d.i] || {}), attempt: d.attempt } },
     action_done: (d) => {
       target.progress[d.i] = { status: 'done', elapsed_ms: d.elapsed_ms, tokens_in: d.tokens_in, tokens_out: d.tokens_out, attempt: target.progress[d.i]?.attempt || 1 }
@@ -594,6 +595,7 @@ async function executePlan(m) {
         m.currentIndex = d.i
         m.progress[d.i] = { status: 'running', attempt: 1 }
       },
+      plan_expanded: (d) => { m.plan = d.plan; m.progress = {} },
       action_attempt: (d) => {
         if (!m.progress[d.i]) m.progress[d.i] = { status: 'running' }
         m.progress[d.i].attempt = d.attempt

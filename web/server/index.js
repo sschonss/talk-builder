@@ -670,7 +670,16 @@ app.post('/api/talks/:slug/execute/stream', async (req, res) => {
 
   let work = JSON.parse(JSON.stringify(slides))
   let anyApplied = false
-  const { planActionLLM, applyAction, isParallelSafe } = await import('./executor.js')
+  const { planActionLLM, applyAction, isParallelSafe, expandBulkActions } = await import('./executor.js')
+
+  const expansion = expandBulkActions(state.plan, work)
+  if (expansion.expanded) {
+    state.plan = expansion.plan
+    state.progress = {}
+    updatePlan(slug, { plan: state.plan, progress: {} })
+    emitPlanEvent(slug, 'plan_expanded', { plan: state.plan })
+    sseSend(res, 'plan_expanded', { plan: state.plan })
+  }
 
   updatePlan(slug, { status: 'running', cancelled: false, error: null })
   const startEv = { total: state.plan.actions.length, preamble: state.plan.preamble, concurrency: cfg.planner_concurrency || 1 }
