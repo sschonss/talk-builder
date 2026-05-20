@@ -129,11 +129,11 @@ function applyAction(action, slides, llmOutput) {
   switch (action.type) {
     case 'edit_slide':       return applyEditSlide(slides, action.idx, llmOutput)
     case 'regenerate_slide': return applyRegenerateSlide(slides, action.idx, llmOutput)
-    case 'add_slides':       return applyAddSlides(slides, action.after, llmOutput)
+    case 'add_slides':       return applyAddSlides(slides, action.after, Array.isArray(llmOutput) ? llmOutput : [llmOutput])
     case 'remove_slide':     return applyRemoveSlide(slides, action.idx)
     case 'move_slide':       return applyMoveSlide(slides, action.from, action.to)
     case 'set_meta':         return applySetMeta(slides, llmOutput)
-    case 'replace_section':  return applyReplaceSection(slides, action.start, action.end, llmOutput)
+    case 'replace_section':  return applyReplaceSection(slides, action.start, action.end, Array.isArray(llmOutput) ? llmOutput : [llmOutput])
     case 'bulk_edit': {
       const indices = Object.keys(llmOutput).map(Number).sort((a, b) => a - b)
       const replacements = indices.map(i => llmOutput[i])

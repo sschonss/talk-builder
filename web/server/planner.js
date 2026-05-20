@@ -5,9 +5,17 @@ function extractJson(text) {
   if (!text) return null
   const fenced = text.match(/```(?:json)?\s*\n([\s\S]+?)\n```/i)
   const candidate = fenced ? fenced[1] : text
-  const start = candidate.indexOf('{')
-  const end = candidate.lastIndexOf('}')
-  if (start < 0 || end < 0) return null
+  const firstObj = candidate.indexOf('{')
+  const firstArr = candidate.indexOf('[')
+  let start = -1, openChar = '', closeChar = ''
+  if (firstObj === -1 && firstArr === -1) return null
+  if (firstObj === -1 || (firstArr !== -1 && firstArr < firstObj)) {
+    start = firstArr; openChar = '['; closeChar = ']'
+  } else {
+    start = firstObj; openChar = '{'; closeChar = '}'
+  }
+  const end = candidate.lastIndexOf(closeChar)
+  if (end < 0 || end < start) return null
   try { return JSON.parse(candidate.slice(start, end + 1)) } catch { return null }
 }
 
