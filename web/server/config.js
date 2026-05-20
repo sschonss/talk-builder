@@ -17,6 +17,7 @@ const DEFAULTS = {
   claude_model: '',
   opencode_binary: 'opencode',
   opencode_model: '',
+  llm_timeout_minutes: 30,
 }
 
 export function loadConfig() {

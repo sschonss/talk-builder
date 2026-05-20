@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process'
 
-function runCli(binary, args, prompt, { timeoutMs = 600_000 } = {}) {
+function runCli(binary, args, prompt, { timeoutMs = 1_800_000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { env: process.env })
     let stdout = '', stderr = ''
@@ -16,7 +16,7 @@ function runCli(binary, args, prompt, { timeoutMs = 600_000 } = {}) {
   })
 }
 
-async function* streamCli(binary, args, { timeoutMs = 600_000 } = {}) {
+async function* streamCli(binary, args, { timeoutMs = 1_800_000 } = {}) {
   const child = spawn(binary, args, { env: process.env })
   const queue = []
   let resolveNext, rejectAll, done = false, error = null
@@ -120,6 +120,12 @@ function checkBinary(binary) {
   } catch { return false }
 }
 
+function timeoutMs(cfg) {
+  const m = Number(cfg?.llm_timeout_minutes)
+  if (!m || m <= 0 || !isFinite(m)) return 1_800_000
+  return Math.min(Math.max(m, 1), 180) * 60 * 1000
+}
+
 async function fetchJson(url, opts) {
   const r = await fetch(url, opts)
   const text = await r.text()
@@ -135,12 +141,12 @@ const providers = {
     run: (prompt, cfg) => {
       const args = ['-p', prompt, '--allow-all-tools']
       if (cfg.copilot_model) args.push('--model', cfg.copilot_model)
-      return runCli(cfg.copilot_binary, args, prompt)
+      return runCli(cfg.copilot_binary, args, prompt, { timeoutMs: timeoutMs(cfg) })
     },
     stream: (prompt, cfg) => {
       const args = ['-p', prompt, '--allow-all-tools']
       if (cfg.copilot_model) args.push('--model', cfg.copilot_model)
-      return streamCli(cfg.copilot_binary, args)
+      return streamCli(cfg.copilot_binary, args, { timeoutMs: timeoutMs(cfg) })
     },
   },
 
@@ -151,12 +157,12 @@ const providers = {
     run: (prompt, cfg) => {
       const args = ['-p', prompt, '--dangerously-skip-permissions']
       if (cfg.claude_model) args.push('--model', cfg.claude_model)
-      return runCli(cfg.claude_binary, args, prompt)
+      return runCli(cfg.claude_binary, args, prompt, { timeoutMs: timeoutMs(cfg) })
     },
     stream: (prompt, cfg) => {
       const args = ['-p', prompt, '--dangerously-skip-permissions']
       if (cfg.claude_model) args.push('--model', cfg.claude_model)
-      return streamCli(cfg.claude_binary, args)
+      return streamCli(cfg.claude_binary, args, { timeoutMs: timeoutMs(cfg) })
     },
   },
 
@@ -168,13 +174,13 @@ const providers = {
       const args = ['run']
       if (cfg.opencode_model) args.push('--model', cfg.opencode_model)
       args.push(prompt)
-      return runCli(cfg.opencode_binary, args, prompt)
+      return runCli(cfg.opencode_binary, args, prompt, { timeoutMs: timeoutMs(cfg) })
     },
     stream: (prompt, cfg) => {
       const args = ['run']
       if (cfg.opencode_model) args.push('--model', cfg.opencode_model)
       args.push(prompt)
-      return streamCli(cfg.opencode_binary, args)
+      return streamCli(cfg.opencode_binary, args, { timeoutMs: timeoutMs(cfg) })
     },
   },
 

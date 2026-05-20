@@ -115,6 +115,7 @@ async function openSettings() {
     claude_model: settings.value.claude_model || '',
     opencode_binary: settings.value.opencode_binary,
     opencode_model: settings.value.opencode_model || '',
+    llm_timeout_minutes: settings.value.llm_timeout_minutes || 30,
   }
   testResult.value = null
   settingsOpen.value = true
@@ -779,6 +780,15 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
             <label class="field">
               <span>Modelo</span>
               <input v-model="settingsDraft.openai_model" placeholder="gpt-4o" />
+            </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Timeout</legend>
+            <label class="field">
+              <span>Timeout do LLM (minutos)</span>
+              <input v-model.number="settingsDraft.llm_timeout_minutes" type="number" min="1" max="180" placeholder="30" />
+              <small>Decks grandes (100+ slides) podem precisar de 30-60min. Máximo 180.</small>
             </label>
           </fieldset>
 
