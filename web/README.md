@@ -99,6 +99,24 @@ Os 3 snapshots são injetados no prompt como contexto ("Versões anteriores dest
 
 Worker background em `server/embeddings.js` chama Ollama (`nomic-embed-text`, 768 dimensões) a cada 15s para vetorizar registros pendentes (`embedding IS NULL`). Vetores são guardados como BLOB Float32 nas colunas `chats.embedding` e `slides.embedding` do SQLite.
 
+### Setup (macOS)
+
+```bash
+# 1. Instala (uma vez)
+brew install ollama
+
+# 2. Sobe o daemon
+open -a Ollama          # ou: ollama serve &
+
+# 3. Baixa o modelo (~274 MB, uma vez)
+ollama pull nomic-embed-text
+
+# 4. Confere
+curl -s http://localhost:11434/api/tags
+```
+
+A partir daí o worker do talk-chat detecta sozinho (poll a cada 15s) e começa a processar.
+
 ### Status
 
 Rodapé da sidebar mostra:
@@ -108,18 +126,35 @@ Rodapé da sidebar mostra:
 
 Endpoint: `GET /api/index/embed-status` → `{pending_chats, pending_slides, done_chats, done_slides, ollama: {ok, error, model}}`.
 
-Forçar processamento agora: `POST /api/index/embed-now`.
+### Forçar processamento
+
+Por padrão o worker processa 10 chats + 10 slides por tick (15s). Para vetorizar tudo rápido:
+
+```bash
+# Dispara um batch agora
+curl -X POST http://localhost:5174/api/index/embed-now
+
+# Ou em loop até zerar
+while true; do
+  r=$(curl -s -X POST http://localhost:5174/api/index/embed-now)
+  echo "$r" | grep -q '"pending_slides":0' && break
+done
+```
+
+### Slides vazios
+
+Se algum slide tem `content` vazio (length 0), o Ollama recusa e o worker fica re-tentando para sempre. Marca manualmente como ignorado:
+
+```bash
+sqlite3 ~/Documents/talks/.index.db \
+  "UPDATE slides SET embedding = X'00' WHERE length(content) = 0;"
+```
+
+(Um BLOB de 1 byte serve como sentinela "tentei e não tem conteúdo".)
 
 ### Sem Ollama
 
 Tudo degrada graciosamente: FTS continua funcionando, painéis semânticos ficam vazios, worker tenta a cada 15s sem crashar.
-
-Para ativar:
-```bash
-brew install ollama
-ollama serve &
-ollama pull nomic-embed-text
-```
 
 ---
 
