@@ -118,6 +118,11 @@ async function openSettings() {
     llm_timeout_minutes: settings.value.llm_timeout_minutes || 30,
     edit_mode: settings.value.edit_mode || 'auto',
     planner_threshold: settings.value.planner_threshold || 30,
+    planner_provider: settings.value.planner_provider || '',
+    planner_model: settings.value.planner_model || '',
+    planner_concurrency: settings.value.planner_concurrency || 3,
+    cache_enabled: settings.value.cache_enabled !== false,
+    autocompact_threshold_tokens: settings.value.autocompact_threshold_tokens || 8000,
   }
   testResult.value = null
   settingsOpen.value = true
@@ -355,6 +360,38 @@ const autoExecuteSession = ref(false)
 const ctxStats = ref(null)
 const ctxModalOpen = ref(false)
 const compacting = ref(false)
+const themes = ref([])
+const themeOpen = ref(false)
+const cacheStats = ref(null)
+
+async function loadThemes() {
+  if (themes.value.length) return
+  try {
+    const r = await api('/api/themes')
+    themes.value = r.themes || []
+  } catch {}
+}
+
+async function applyTheme(id) {
+  if (!currentSlug.value) return
+  try {
+    await api(`/api/talks/${currentSlug.value}/theme`, { method: 'POST', body: { id } })
+    const data = await api(`/api/talks/${currentSlug.value}`)
+    slides.value = data.slides
+    slidesMtime.value = data.slides_mtime
+    themeOpen.value = false
+  } catch (e) { error.value = e.message }
+}
+
+async function refreshCacheStats() {
+  try { cacheStats.value = await api('/api/cache/stats') } catch { cacheStats.value = null }
+}
+
+async function clearCache() {
+  if (!confirm('Limpar todo o cache de LLM?')) return
+  await api('/api/cache/clear', { method: 'POST' })
+  await refreshCacheStats()
+}
 
 async function refreshContextStats(slug) {
   if (!slug) { ctxStats.value = null; return }
@@ -410,14 +447,47 @@ function describeAction(a) {
 function progressLabel(m, ai) {
   const p = m.progress?.[ai]
   if (!p) return ''
-  if (p.status === 'running') return `... tentativa ${p.attempt || 1}`
-  if (p.status === 'done') return `ok (${Math.round((p.elapsed_ms || 0) / 100) / 10}s)`
+  if (p.status === 'running') {
+    const chunks = p.chunks ? ` · ${fmtTok(p.chunks)}c` : ''
+    return `... tentativa ${p.attempt || 1}${chunks}`
+  }
+  if (p.status === 'done') {
+    const cache = p.cached ? ' [cache]' : ''
+    return `ok (${Math.round((p.elapsed_ms || 0) / 100) / 10}s)${cache}`
+  }
   if (p.status === 'error') return `falhou`
   return ''
 }
 
 function hasDestructive(plan) {
   return (plan.actions || []).some(a => a.type === 'remove_slide' || a.type === 'replace_section')
+}
+
+function hasInstruction(a) {
+  return 'instruction' in a || 'transform' in a || 'topic' in a
+}
+
+async function removeAction(m, ai) {
+  if (!m.plan) return
+  if (!confirm(`Remover ação ${ai} (${m.plan.actions[ai].type})?`)) return
+  const newActions = m.plan.actions.slice()
+  newActions.splice(ai, 1)
+  if (!newActions.length) { cancelPlan(m); return }
+  try {
+    const r = await api(`/api/talks/${currentSlug.value}/plan`, { method: 'PATCH', body: { actions: newActions } })
+    m.plan = r.plan
+    m.progress = {}
+    m.editing = null
+  } catch (e) { error.value = e.message }
+}
+
+async function savePlanEdits(m) {
+  if (!m.plan) return
+  try {
+    const r = await api(`/api/talks/${currentSlug.value}/plan`, { method: 'PATCH', body: { actions: m.plan.actions } })
+    m.plan = r.plan
+    m.editing = null
+  } catch (e) { error.value = e.message }
 }
 
 async function send() {
@@ -508,6 +578,7 @@ function cancelPlan(m) {
 
 async function executePlan(m) {
   if (!m.plan) return
+  if (m.editing != null) await savePlanEdits(m)
   m.status = 'running'
   m.errorMsg = ''
   m.progress = m.progress || {}
@@ -526,6 +597,11 @@ async function executePlan(m) {
       action_attempt: (d) => {
         if (!m.progress[d.i]) m.progress[d.i] = { status: 'running' }
         m.progress[d.i].attempt = d.attempt
+      },
+      action_chunk: (d) => {
+        if (!m.progress[d.i]) m.progress[d.i] = { status: 'running' }
+        m.progress[d.i].chunks = (m.progress[d.i].chunks || 0) + (d.len || 0)
+        if (d.cached) m.progress[d.i].cached = true
       },
       action_done: (d) => {
         m.progress[d.i] = {
@@ -802,8 +878,17 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
           <button v-if="currentSlug" class="ctx-badge" @click="ctxModalOpen = true" :title="'Contexto estimado por turno'">
             ctx {{ ctxStats ? fmtTok(ctxStats.classic_prompt_tokens_est) : '-' }}
           </button>
+          <button v-if="currentSlug" class="ctx-badge" @click="() => { loadThemes(); themeOpen = true }" :title="'Trocar tema visual'">
+            tema {{ slides?.theme?.id || '?' }}
+          </button>
         </div>
       </header>
+
+      <div v-if="ctxStats?.should_compact" class="autocompact-banner">
+        Chat acumulou ~{{ fmtTok(ctxStats.chat_tokens_est) }} tokens. Considere
+        <button class="link-btn" @click="ctxModalOpen = true">compactar</button>
+        antes do próximo turno pra economizar.
+      </div>
 
       <div ref="listEl" class="chat">
         <p v-if="!messages.length && !sending" class="empty-chat">
@@ -818,10 +903,18 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
             <ol class="plan-actions">
               <li v-for="(a, ai) in m.plan.actions" :key="ai" :class="['plan-action', m.progress?.[ai]?.status || 'pending']">
                 <span class="pa-type">{{ a.type }}</span>
-                <span class="pa-desc">{{ describeAction(a) }}</span>
+                <span class="pa-desc" v-if="m.editing !== ai">{{ describeAction(a) }}</span>
+                <input v-else class="pa-edit" v-model="a.instruction" @keydown.enter.prevent="m.editing = null" />
                 <span class="pa-status">{{ progressLabel(m, ai) }}</span>
                 <span class="pa-tokens" v-if="m.progress?.[ai]?.tokens_in != null">
                   {{ fmtTok(m.progress[ai].tokens_in) }}↑ {{ fmtTok(m.progress[ai].tokens_out) }}↓
+                  <span v-if="m.progress[ai].cached" class="cache-badge" title="resposta veio do cache">cache</span>
+                </span>
+                <span class="pa-edits" v-if="m.status === 'awaiting'">
+                  <button v-if="hasInstruction(a)" class="link-btn" @click="m.editing = (m.editing === ai ? null : ai)" :title="m.editing === ai ? 'fechar' : 'editar instrução'">
+                    {{ m.editing === ai ? 'ok' : 'editar' }}
+                  </button>
+                  <button class="link-btn danger" @click="removeAction(m, ai)" title="remover ação">×</button>
                 </span>
               </li>
             </ol>
@@ -1034,6 +1127,30 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
       </div>
     </section>
 
+    <div v-if="themeOpen" class="modal-backdrop" @click.self="themeOpen = false">
+      <div class="modal">
+        <header><h3>Tema da apresentação</h3></header>
+        <div class="modal-body">
+          <p style="margin: 0 0 8px; color: var(--muted); font-size: 12px;">
+            Cada talk pode ter sua própria identidade visual. O build.sh usa essas cores/fontes no pptx.
+          </p>
+          <div class="theme-grid">
+            <button v-for="t in themes" :key="t.id"
+              :class="['theme-card', { active: slides?.theme?.id === t.id }]"
+              @click="applyTheme(t.id)"
+              :style="{ background: t.config.colors.background, color: t.config.colors.text, borderColor: t.config.colors.secondary }">
+              <div class="theme-title" :style="{ color: t.config.colors.primary, fontFamily: t.config.fonts.heading }">{{ t.label }}</div>
+              <div class="theme-sub" :style="{ color: t.config.colors.secondary }">Aa Bb · {{ t.config.fonts.body }}</div>
+              <div class="theme-id">{{ t.id }}</div>
+            </button>
+          </div>
+        </div>
+        <footer>
+          <div class="footer-btns"><button @click="themeOpen = false">Fechar</button></div>
+        </footer>
+      </div>
+    </div>
+
     <div v-if="ctxModalOpen" class="modal-backdrop" @click.self="ctxModalOpen = false">
       <div class="modal">
         <header><h3>Contexto</h3></header>
@@ -1041,7 +1158,7 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
           <p style="margin: 0 0 8px; color: var(--muted); font-size: 12px;">
             Estimativas em tokens (≈ chars / 4). Provedores CLI não reportam tokens reais.
           </p>
-          <table class="ctx-table">
+          <table class="ctx-table"><tbody>
             <tr><td>Mensagens no chat</td><td>{{ ctxStats.chat_messages }}</td></tr>
             <tr><td>Chars do chat</td><td>{{ ctxStats.chat_chars.toLocaleString() }}</td></tr>
             <tr><td>~tokens chat</td><td>{{ fmtTok(ctxStats.chat_tokens_est) }}</td></tr>
@@ -1050,7 +1167,7 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
             <tr><td>~tokens resumo do deck</td><td>{{ fmtTok(ctxStats.summary_tokens_est) }}</td></tr>
             <tr class="hi"><td>Prompt clássico (por turno)</td><td>{{ fmtTok(ctxStats.classic_prompt_tokens_est) }}</td></tr>
             <tr class="hi"><td>Prompt planner (por turno)</td><td>{{ fmtTok(ctxStats.planner_prompt_tokens_est) }}</td></tr>
-          </table>
+          </tbody></table>
           <p style="margin: 12px 0 6px; color: var(--muted); font-size: 12px;">
             Compactar resume todas as mensagens em um único parágrafo de "system", preservando as 4 mais recentes intactas.
           </p>
@@ -1160,6 +1277,40 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
               <span>Threshold do auto (slides)</span>
               <input v-model.number="settingsDraft.planner_threshold" type="number" min="1" max="500" placeholder="30" />
               <small>Em "auto", planner é usado quando o deck tem pelo menos esse número de slides.</small>
+            </label>
+            <label class="field">
+              <span>Concorrência do executor</span>
+              <input v-model.number="settingsDraft.planner_concurrency" type="number" min="1" max="8" placeholder="3" />
+              <small>Quantas ações paralelas o executor roda. Só ações que não mexem em índice (edit_slide, regenerate_slide, set_meta) são paralelizáveis.</small>
+            </label>
+            <label class="field">
+              <span>Provider do planner (opcional)</span>
+              <select v-model="settingsDraft.planner_provider">
+                <option value="">(usar o mesmo do executor)</option>
+                <option value="copilot">copilot</option>
+                <option value="claude">claude</option>
+                <option value="opencode">opencode</option>
+                <option value="anthropic">anthropic</option>
+                <option value="openai">openai</option>
+              </select>
+              <small>Use um modelo mais barato pra planejar. Vazio = mesmo do executor.</small>
+            </label>
+            <label class="field" v-if="settingsDraft.planner_provider">
+              <span>Modelo do planner</span>
+              <input v-model="settingsDraft.planner_model" placeholder="ex: gpt-4o-mini ou claude-haiku" />
+            </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Cache e contexto</legend>
+            <label class="field">
+              <span><input type="checkbox" v-model="settingsDraft.cache_enabled" /> Cache de respostas do LLM</span>
+              <small>Cacheia hash(provider+modelo+prompt) → resposta por 7 dias. Útil pra repetições e retries.</small>
+            </label>
+            <label class="field">
+              <span>Auto-aviso de compactação (tokens)</span>
+              <input v-model.number="settingsDraft.autocompact_threshold_tokens" type="number" min="500" max="100000" placeholder="8000" />
+              <small>Quando o chat passa desse tamanho, aparece um banner sugerindo compactar.</small>
             </label>
           </fieldset>
 
@@ -1427,4 +1578,18 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
 .ctx-table td { padding: 4px 6px; border-bottom: 1px dashed var(--border); }
 .ctx-table td:last-child { text-align: right; font-family: Menlo, monospace; color: var(--text); }
 .ctx-table tr.hi td { color: var(--text); font-weight: 600; }
+.pa-edit { background: #111; border: 1px solid var(--border); color: var(--text); font-size: 12px; padding: 2px 6px; border-radius: 3px; font-family: inherit; min-width: 0; }
+.pa-edits { display: inline-flex; gap: 4px; align-items: center; }
+.link-btn { background: transparent; border: 0; color: var(--muted); font-size: 11px; cursor: pointer; padding: 2px 6px; font-family: Menlo, monospace; }
+.link-btn:hover { color: var(--text); }
+.link-btn.danger:hover { color: #e67a7a; }
+.cache-badge { display: inline-block; padding: 0 4px; border-radius: 3px; font-size: 9px; background: #1a3a5c; color: #9ec5e0; margin-left: 4px; text-transform: uppercase; }
+.autocompact-banner { padding: 6px 12px; background: #2b1f0a; border-bottom: 1px solid #4a3a1a; color: #e6c97a; font-size: 12px; }
+.theme-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+.theme-card { padding: 16px; border: 2px solid; border-radius: 6px; cursor: pointer; text-align: left; min-height: 90px; transition: transform 120ms; font-family: inherit; }
+.theme-card:hover { transform: translateY(-2px); }
+.theme-card.active { box-shadow: 0 0 0 3px var(--text); }
+.theme-title { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+.theme-sub { font-size: 12px; margin-bottom: 8px; }
+.theme-id { font-family: Menlo, monospace; font-size: 10px; opacity: 0.6; }
 </style>

@@ -157,6 +157,62 @@ Botão `ctx Nk` no header mostra a estimativa de quanto contexto vai por turno:
 
 `POST /api/talks/:slug/chat/compact` chama o LLM pra resumir todas as mensagens menos as N mais recentes (`keep_last`, padrão 4) em uma única mensagem `system`. Útil pra decks usados há muito tempo, onde o histórico fica caro no modo clássico.
 
+Quando o chat passa de `autocompact_threshold_tokens` (padrão 8000), aparece um banner sugerindo a compactação antes do próximo turno.
+
+---
+
+## Themes (estilo por talk)
+
+Cada talk tem uma identidade visual própria no `slides.json` (`theme.id` + `theme.config.{colors,fonts}`), consumida pelo `build_pptx.py`.
+
+8 temas curados em `server/themes.js`: `midnight`, `paper`, `ocean`, `forest`, `sunset`, `mono`, `terminal`, `newsprint`.
+
+- Talks novas escolhem um tema deterministicamente pelo hash do título.
+- Botão `tema X` no header abre o seletor visual.
+- API: `GET /api/themes`, `POST /api/talks/:slug/theme {id}`.
+
+---
+
+## Cache de LLM
+
+`server/cache.js` guarda `sha256(provider + model + prompt) → reply` em `~/Documents/talks/.llm-cache/`. TTL de 7 dias, LRU de no máximo 2000 arquivos.
+
+- Toda chamada do executor passa pelo cache antes de bater no provider.
+- Útil em retries (mesmo prompt sai do cache) e em desenvolvimento.
+- Cada ação no cartão mostra um badge `cache` quando a resposta veio dali.
+- API: `GET /api/cache/stats`, `POST /api/cache/clear`.
+- Override de diretório: `TALK_CACHE_DIR=...`.
+- Desligar via Settings → Cache e contexto.
+
+---
+
+## Paralelização e streaming por ação
+
+O executor agrupa ações **não-shifting** (`edit_slide`, `regenerate_slide`, `set_meta`) em lotes de até `planner_concurrency` (padrão 3, máx 8) que rodam o LLM em paralelo (`Promise.all`) sobre um snapshot. Aplicação no `slides.json` continua sequencial dentro do lote para preservar a ordem.
+
+Ações que mexem em índice (`add_slides`, `remove_slide`, `move_slide`, `replace_section`, `bulk_edit`) sempre rodam sozinhas.
+
+Cada ação usa `streamProvider`: SSE emite `action_chunk { i, text, len, cached }`. O cartão mostra os chars acumulados em tempo real (`... tentativa 1 · Nc`).
+
+---
+
+## Edição do plano antes de executar
+
+Enquanto o plano está com status `awaiting`, você pode:
+
+- **Editar a instrução** de qualquer ação (botão `editar` na linha)
+- **Remover** uma ação (botão `×`)
+
+Persistência via `PATCH /api/talks/:slug/plan { actions }`. Editar resetando `progress`. Não é permitido durante execução.
+
+---
+
+## Modelo separado pro planner
+
+`planner_provider` e `planner_model` (opcionais) deixam o planner rodar num modelo diferente do executor. Vazio = mesmo do executor. Útil pra usar um modelo barato/rápido só pra estruturar o JSON.
+
+---
+
 ---
 
 ## Vetorização (embeddings)
