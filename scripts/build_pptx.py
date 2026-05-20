@@ -230,6 +230,17 @@ def t_answer(s, d):
     bullet_list(s, Inches(0.8), Inches(2.7), Inches(11.7), Inches(4.0),
                 d.get("bullets") or [], size=26, gap=Pt(14))
 
+def _md_lines(text):
+    if not text: return []
+    out = []
+    for ln in str(text).splitlines():
+        s = ln.strip()
+        if not s: continue
+        if s.startswith(('- ', '* ', '• ', '— ', '– ')): s = s[2:].strip()
+        elif s.startswith(('-', '*', '•')): s = s[1:].strip()
+        out.append(s)
+    return out
+
 def t_content(s, d):
     add_bg(s)
     accent_bar(s, Inches(0.8), Inches(0.8))
@@ -241,8 +252,11 @@ def t_content(s, d):
              d["subtitle"], size=20, color=SECONDARY, font=FONT_B); y = Inches(2.45)
     glossary = d.get("glossary") or []
     bullets_h = Inches(4.3) if not glossary else Inches(2.9)
+    bullets = d.get("bullets")
+    if not bullets:
+        bullets = _md_lines(d.get("body") or d.get("text") or d.get("content") or "")
     bullet_list(s, Inches(0.8), y, Inches(11.7), bullets_h,
-                d.get("bullets") or [], size=24)
+                bullets or [], size=24)
     if glossary:
         gy = Inches(5.6)
         rect(s, Inches(0.8), gy, Inches(11.7), Inches(1.4),
@@ -289,8 +303,8 @@ def t_comparison(s, d):
     right = _coerce(d.get("right"))
     left_title  = d.get("left_title")  or left.get("title", "")
     right_title = d.get("right_title") or right.get("title", "")
-    left_items  = d.get("left_items")  or left.get("bullets")  or left.get("items")  or []
-    right_items = d.get("right_items") or right.get("bullets") or right.get("items") or []
+    left_items  = d.get("left_items")  or left.get("bullets")  or left.get("items")  or _md_lines(d.get("left_body"))  or []
+    right_items = d.get("right_items") or right.get("bullets") or right.get("items") or _md_lines(d.get("right_body")) or []
     col_w = Inches(5.6); gap = Inches(0.5)
     left_x = Inches(0.8); right_x = left_x + col_w + gap
     col_top = Inches(2.2); col_h = Inches(4.6)
@@ -331,7 +345,7 @@ def t_diagram(s, d):
     else:
         rect(s, area_l, area_t, area_w, area_h, fill=PANEL, line=BORDER,
              shape=MSO_SHAPE.ROUNDED_RECTANGLE)
-        code = d.get("mermaid_code","")
+        code = d.get("mermaid_code") or d.get("diagram") or d.get("mermaid") or d.get("description") or ""
         tb = s.shapes.add_textbox(area_l+Inches(0.2), area_t+Inches(0.2),
                                   area_w-Inches(0.4), area_h-Inches(0.4))
         tf = tb.text_frame; tf.word_wrap = True
@@ -358,7 +372,7 @@ def t_code(s, d):
     tb = s.shapes.add_textbox(box_l + Inches(0.3), box_t + Inches(0.2),
                               box_w - Inches(0.6), box_h - Inches(0.4))
     tf = tb.text_frame; tf.word_wrap = True
-    for i, ln in enumerate((d.get("code","") or "").split("\n")):
+    for i, ln in enumerate((d.get("code") or d.get("snippet") or d.get("source") or "").split("\n")):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         r = p.add_run(); r.text = ln or " "
         r.font.name = FONT_C; r.font.size = Pt(16); r.font.color.rgb = RGBColor(0xE6,0xE6,0xE6)
