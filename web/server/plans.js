@@ -13,6 +13,8 @@ export function setPlan(slug, plan, userPrompt) {
     tokens: { in: 0, out: 0 },
     msgIndex: null,
     listeners: new Set(),
+    logs: {},
+    controllers: {},
     createdAt: Date.now(),
     updatedAt: Date.now(),
   }
@@ -56,7 +58,37 @@ export function cancelPlan(slug) {
   const s = plans.get(slug)
   if (!s) return false
   s.cancelled = true
+  if (s.controllers) {
+    for (const c of Object.values(s.controllers)) {
+      try { c.abort() } catch {}
+    }
+  }
   return true
+}
+
+export function cancelAction(slug, i) {
+  const s = plans.get(slug)
+  if (!s || !s.controllers || !s.controllers[i]) return false
+  try { s.controllers[i].abort() } catch {}
+  return true
+}
+
+export function appendLog(slug, i, patch) {
+  const s = plans.get(slug)
+  if (!s) return
+  if (!s.logs[i]) s.logs[i] = { prompt: '', reply: '', attempts: [] }
+  if (patch.prompt != null) s.logs[i].prompt = patch.prompt
+  if (patch.attempt != null) s.logs[i].attempts.push({ at: Date.now(), attempt: patch.attempt })
+  if (patch.replyChunk) s.logs[i].reply += patch.replyChunk
+  if (patch.reset) s.logs[i].reply = ''
+  if (patch.cached) s.logs[i].cached = true
+  if (patch.error != null) s.logs[i].error = patch.error
+}
+
+export function getLog(slug, i) {
+  const s = plans.get(slug)
+  if (!s || !s.logs[i]) return null
+  return s.logs[i]
 }
 
 export function estimateTokens(text) {

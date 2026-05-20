@@ -491,6 +491,38 @@ async function savePlanEdits(m) {
   } catch (e) { error.value = e.message }
 }
 
+const logOpen = ref(false)
+const logData = ref(null)
+let logTimer = null
+async function openActionLog(ai) {
+  logOpen.value = true
+  logData.value = { i: ai, log: null, loading: true }
+  await refreshActionLog(ai)
+  if (logTimer) clearInterval(logTimer)
+  logTimer = setInterval(() => {
+    if (!logOpen.value) { clearInterval(logTimer); logTimer = null; return }
+    refreshActionLog(ai)
+  }, 1500)
+}
+async function refreshActionLog(ai) {
+  try {
+    const r = await api(`/api/talks/${currentSlug.value}/plan/log/${ai}`)
+    logData.value = { i: ai, log: r.log, loading: false }
+  } catch (e) {
+    logData.value = { i: ai, log: null, loading: false, error: e.message }
+  }
+}
+function closeLog() {
+  logOpen.value = false
+  if (logTimer) { clearInterval(logTimer); logTimer = null }
+}
+async function cancelActionRow(ai) {
+  if (!confirm(`Cancelar ação ${ai}? O plano continua nas próximas.`)) return
+  try {
+    await api(`/api/talks/${currentSlug.value}/plan/cancel-action`, { method: 'POST', body: { i: ai } })
+  } catch (e) { error.value = e.message }
+}
+
 async function send() {
   const content = input.value.trim()
   if (!content || sending.value || !currentSlug.value) return
@@ -918,8 +950,16 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
                   </button>
                   <button class="link-btn danger" @click="removeAction(m, ai)" title="remover ação">×</button>
                 </span>
+                <span class="pa-edits">
+                  <button class="link-btn" @click="openActionLog(ai)" title="ver prompt e resposta">log</button>
+                  <button v-if="m.status === 'running' && m.progress?.[ai]?.status === 'running'" class="link-btn danger" @click="cancelActionRow(ai)" title="cancelar essa ação">parar</button>
+                </span>
               </li>
             </ol>
+            <div v-if="m.status === 'running'" class="plan-controls">
+              <small>Executando ação {{ (m.currentIndex ?? 0) + 1 }}/{{ m.plan.actions.length }}...</small>
+              <button class="link-btn danger" @click="cancelPlan(m)" style="margin-left: 8px;">cancelar plano todo</button>
+            </div>
             <div v-if="m.tokens && (m.tokens.in || m.tokens.out)" class="plan-totals">
               total: {{ fmtTok(m.tokens.in) }} tokens entrada · {{ fmtTok(m.tokens.out) }} saída
             </div>
@@ -933,9 +973,6 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
                 <button @click="cancelPlan(m)">Cancelar</button>
                 <button class="primary" @click="executePlan(m)">Executar</button>
               </div>
-            </div>
-            <div v-else-if="m.status === 'running'" class="plan-controls">
-              <small>Executando ação {{ (m.currentIndex ?? 0) + 1 }}/{{ m.plan.actions.length }}...</small>
             </div>
             <div v-else-if="m.status === 'error'" class="plan-controls">
               <p class="err">{{ m.errorMsg }}</p>
@@ -1149,6 +1186,29 @@ watch(messages, () => nextTick(scrollBottom), { deep: true })
         </div>
         <footer>
           <div class="footer-btns"><button @click="themeOpen = false">Fechar</button></div>
+        </footer>
+      </div>
+    </div>
+
+    <div v-if="logOpen" class="modal-backdrop" @click.self="closeLog">
+      <div class="modal" style="max-width: 920px;">
+        <header><h3>Log da ação {{ logData?.i }}</h3></header>
+        <div class="modal-body" v-if="logData?.log">
+          <p style="margin: 0 0 6px; color: var(--muted); font-size: 12px;">
+            tentativas: {{ logData.log.attempts?.length || 0 }}
+            <span v-if="logData.log.cached"> · cache</span>
+            <span v-if="logData.log.error"> · erro: {{ logData.log.error }}</span>
+          </p>
+          <h4 style="margin: 12px 0 4px; font-size: 12px; color: var(--muted);">Prompt enviado</h4>
+          <pre class="raw-pre" style="max-height: 280px;">{{ logData.log.prompt }}</pre>
+          <h4 style="margin: 12px 0 4px; font-size: 12px; color: var(--muted);">Resposta acumulada ({{ logData.log.reply?.length || 0 }} chars)</h4>
+          <pre class="raw-pre" style="max-height: 280px;">{{ logData.log.reply || '(aguardando)' }}</pre>
+        </div>
+        <div class="modal-body" v-else>
+          <p style="color: var(--muted);">{{ logData?.error || 'Carregando...' }}</p>
+        </div>
+        <footer>
+          <div class="footer-btns"><button @click="closeLog">Fechar</button></div>
         </footer>
       </div>
     </div>

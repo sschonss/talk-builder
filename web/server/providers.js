@@ -16,11 +16,16 @@ function runCli(binary, args, prompt, { timeoutMs = 1_800_000 } = {}) {
   })
 }
 
-async function* streamCli(binary, args, { timeoutMs = 1_800_000 } = {}) {
+async function* streamCli(binary, args, { timeoutMs = 1_800_000, signal } = {}) {
   const child = spawn(binary, args, { env: process.env })
   const queue = []
   let resolveNext, rejectAll, done = false, error = null
   const t = setTimeout(() => { child.kill('SIGTERM'); error = new Error(`${binary} timed out`); if (resolveNext) resolveNext() }, timeoutMs)
+  const onAbort = () => { try { child.kill('SIGTERM') } catch {}; error = new Error('cancelled'); done = true; if (resolveNext) { const r = resolveNext; resolveNext = null; r() } }
+  if (signal) {
+    if (signal.aborted) { onAbort() }
+    else signal.addEventListener('abort', onAbort, { once: true })
+  }
 
   child.stdout.on('data', d => {
     queue.push(d.toString())
@@ -40,9 +45,10 @@ async function* streamCli(binary, args, { timeoutMs = 1_800_000 } = {}) {
   if (error) throw error
 }
 
-async function* streamAnthropic(prompt, cfg) {
+async function* streamAnthropic(prompt, cfg, { signal } = {}) {
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal,
     headers: {
       'content-type': 'application/json',
       'x-api-key': cfg.anthropic_api_key,
@@ -77,9 +83,10 @@ async function* streamAnthropic(prompt, cfg) {
   }
 }
 
-async function* streamOpenAI(prompt, cfg) {
+async function* streamOpenAI(prompt, cfg, { signal } = {}) {
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
+    signal,
     headers: {
       'content-type': 'application/json',
       authorization: `Bearer ${cfg.openai_api_key}`,
@@ -143,10 +150,10 @@ const providers = {
       if (cfg.copilot_model) args.push('--model', cfg.copilot_model)
       return runCli(cfg.copilot_binary, args, prompt, { timeoutMs: timeoutMs(cfg) })
     },
-    stream: (prompt, cfg) => {
+    stream: (prompt, cfg, opts) => {
       const args = ['-p', prompt, '--allow-all-tools']
       if (cfg.copilot_model) args.push('--model', cfg.copilot_model)
-      return streamCli(cfg.copilot_binary, args, { timeoutMs: timeoutMs(cfg) })
+      return streamCli(cfg.copilot_binary, args, { timeoutMs: timeoutMs(cfg), signal: opts?.signal })
     },
   },
 
@@ -159,10 +166,10 @@ const providers = {
       if (cfg.claude_model) args.push('--model', cfg.claude_model)
       return runCli(cfg.claude_binary, args, prompt, { timeoutMs: timeoutMs(cfg) })
     },
-    stream: (prompt, cfg) => {
+    stream: (prompt, cfg, opts) => {
       const args = ['-p', prompt, '--dangerously-skip-permissions']
       if (cfg.claude_model) args.push('--model', cfg.claude_model)
-      return streamCli(cfg.claude_binary, args, { timeoutMs: timeoutMs(cfg) })
+      return streamCli(cfg.claude_binary, args, { timeoutMs: timeoutMs(cfg), signal: opts?.signal })
     },
   },
 
@@ -176,11 +183,11 @@ const providers = {
       args.push(prompt)
       return runCli(cfg.opencode_binary, args, prompt, { timeoutMs: timeoutMs(cfg) })
     },
-    stream: (prompt, cfg) => {
+    stream: (prompt, cfg, opts) => {
       const args = ['run']
       if (cfg.opencode_model) args.push('--model', cfg.opencode_model)
       args.push(prompt)
-      return streamCli(cfg.opencode_binary, args, { timeoutMs: timeoutMs(cfg) })
+      return streamCli(cfg.opencode_binary, args, { timeoutMs: timeoutMs(cfg), signal: opts?.signal })
     },
   },
 
@@ -205,9 +212,9 @@ const providers = {
       })
       return (data.content || []).map(c => c.text || '').join('\n')
     },
-    stream: (prompt, cfg) => {
+    stream: (prompt, cfg, opts) => {
       if (!cfg.anthropic_api_key) throw new Error('Configure a Anthropic API key em Settings')
-      return streamAnthropic(prompt, cfg)
+      return streamAnthropic(prompt, cfg, opts)
     },
   },
 
@@ -230,9 +237,9 @@ const providers = {
       })
       return data.choices?.[0]?.message?.content || ''
     },
-    stream: (prompt, cfg) => {
+    stream: (prompt, cfg, opts) => {
       if (!cfg.openai_api_key) throw new Error('Configure a OpenAI API key em Settings')
-      return streamOpenAI(prompt, cfg)
+      return streamOpenAI(prompt, cfg, opts)
     },
   },
 }
@@ -256,11 +263,11 @@ export async function runProvider(id, prompt, cfg) {
   return p.run(prompt, cfg)
 }
 
-export function streamProvider(id, prompt, cfg) {
+export function streamProvider(id, prompt, cfg, opts = {}) {
   const p = providers[id]
   if (!p) throw new Error(`provider ${id} desconhecido`)
   if (!p.stream) throw new Error(`provider ${id} não suporta streaming`)
-  return p.stream(prompt, cfg)
+  return p.stream(prompt, cfg, opts)
 }
 
 export const PROVIDER_IDS = Object.keys(providers)

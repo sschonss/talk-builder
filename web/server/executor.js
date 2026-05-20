@@ -156,7 +156,7 @@ export function isParallelSafe(action) {
   return !INDEX_SHIFTING.has(action.type)
 }
 
-async function callLLM(cfg, prompt, { onChunk, useCache = true } = {}) {
+async function callLLM(cfg, prompt, { onChunk, useCache = true, signal } = {}) {
   const model = cfg[`${cfg.provider}_model`] || ''
   if (useCache) {
     const hit = cacheGet(cfg.provider, model, prompt)
@@ -168,7 +168,7 @@ async function callLLM(cfg, prompt, { onChunk, useCache = true } = {}) {
   let reply
   if (onChunk) {
     let acc = ''
-    const gen = streamProvider(cfg.provider, prompt, cfg)
+    const gen = streamProvider(cfg.provider, prompt, cfg, { signal })
     for await (const chunk of gen) {
       if (typeof chunk === 'string') {
         acc += chunk
@@ -221,7 +221,7 @@ export async function executeAction({ slides, action, cfg, onAttempt, onChunk, u
   }
 }
 
-export async function planActionLLM({ slides, action, cfg, onChunk, useCache = true }) {
+export async function planActionLLM({ slides, action, cfg, onChunk, useCache = true, signal, onPrompt }) {
   if (NO_LLM.has(action.type)) {
     return { ok: true, llmOutput: null, tokens_in: 0, tokens_out: 0, cached: false }
   }
@@ -234,8 +234,9 @@ export async function planActionLLM({ slides, action, cfg, onChunk, useCache = t
     if (attempt > 1 && lastError) {
       prompt += `\n\nSua tentativa anterior falhou com este erro:\n${lastError}\n\nRaw output anterior (primeiros 800 chars):\n${(lastRaw || '').slice(0, 800)}\n\nCorrija o JSON e tente de novo.`
     }
+    if (onPrompt) onPrompt(prompt, attempt)
     try {
-      const { reply, cached } = await callLLM(cfg, prompt, { onChunk, useCache })
+      const { reply, cached } = await callLLM(cfg, prompt, { onChunk, useCache, signal })
       cachedAny = cachedAny || cached
       lastRaw = reply
       const json = extractJson(reply)
@@ -246,6 +247,7 @@ export async function planActionLLM({ slides, action, cfg, onChunk, useCache = t
       }
     } catch (e) {
       lastError = e.message
+      if (signal?.aborted) break
     }
   }
   return {

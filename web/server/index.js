@@ -629,6 +629,21 @@ app.post('/api/talks/:slug/plan/cancel', async (req, res) => {
   res.json({ cancelled: cancelPlan(req.params.slug) })
 })
 
+app.post('/api/talks/:slug/plan/cancel-action', async (req, res) => {
+  const { cancelAction } = await import('./plans.js')
+  const i = Number(req.body?.i)
+  if (!Number.isInteger(i)) return res.status(400).json({ error: 'i inválido' })
+  res.json({ cancelled: cancelAction(req.params.slug, i), i })
+})
+
+app.get('/api/talks/:slug/plan/log/:i', async (req, res) => {
+  const { getLog } = await import('./plans.js')
+  const i = Number(req.params.i)
+  const log = getLog(req.params.slug, i)
+  if (!log) return res.status(404).json({ error: 'sem log' })
+  res.json({ i, log })
+})
+
 app.get('/api/talks/:slug/plan/stream', async (req, res) => {
   const { getPlan, subscribePlan } = await import('./plans.js')
   const s = getPlan(req.params.slug)
@@ -697,33 +712,47 @@ app.post('/api/talks/:slug/execute/stream', async (req, res) => {
     emitPlanEvent(slug, ev, data)
   }
 
+  const { appendLog } = await import('./plans.js')
+
   async function runSingle(i, snapshot) {
     const action = state.plan.actions[i]
     const t0 = Date.now()
     state.currentIndex = i
+    const controller = new AbortController()
+    state.controllers[i] = controller
+    appendLog(slug, i, { reset: true })
     emit('action_start', { i, action })
     state.progress[i] = { status: 'running', attempt: 1, chunks: 0 }
     try {
       const r = await planActionLLM({
-        slides: snapshot, action, cfg, useCache,
+        slides: snapshot, action, cfg, useCache, signal: controller.signal,
+        onPrompt: (prompt, attempt) => appendLog(slug, i, { prompt, attempt, reset: attempt === 1 }),
         onChunk: (text, meta) => {
           state.progress[i].chunks = (state.progress[i].chunks || 0) + text.length
+          appendLog(slug, i, { replyChunk: text, cached: !!meta?.cached })
           emit('action_chunk', { i, text: text.slice(0, 400), len: text.length, cached: !!meta?.cached })
         },
       })
+      delete state.controllers[i]
       state.tokens.in += r.tokens_in || 0
       state.tokens.out += r.tokens_out || 0
       if (!r.ok) {
-        state.progress[i] = { status: 'error', error: r.error, attempt: state.progress[i]?.attempt || 1 }
-        emit('action_error', { i, error: r.error, raw: (r.raw || '').slice(0, 1000), retryable: true, tokens: state.tokens })
-        return { ok: false, i, error: r.error }
+        const cancelled = controller.signal.aborted
+        const err = cancelled ? 'cancelada pelo usuário' : r.error
+        state.progress[i] = { status: 'error', error: err, attempt: state.progress[i]?.attempt || 1, cancelled }
+        appendLog(slug, i, { error: err })
+        emit('action_error', { i, error: err, raw: (r.raw || '').slice(0, 1000), retryable: true, cancelled, tokens: state.tokens })
+        return { ok: false, i, error: err, cancelled }
       }
       return { ok: true, i, llmOutput: r.llmOutput, elapsed_ms: Date.now() - t0, tokens_in: r.tokens_in, tokens_out: r.tokens_out, cached: r.cached }
     } catch (e) {
+      delete state.controllers[i]
       const msg = String(e.message || e)
-      state.progress[i] = { status: 'error', error: msg }
-      emit('action_error', { i, error: msg, retryable: true })
-      return { ok: false, i, error: msg }
+      const cancelled = controller.signal.aborted
+      state.progress[i] = { status: 'error', error: cancelled ? 'cancelada pelo usuário' : msg, cancelled }
+      appendLog(slug, i, { error: msg })
+      emit('action_error', { i, error: msg, retryable: true, cancelled })
+      return { ok: false, i, error: msg, cancelled }
     }
   }
 
@@ -750,6 +779,7 @@ app.post('/api/talks/:slug/execute/stream', async (req, res) => {
 
       for (const r of results) {
         if (!r.ok) {
+          if (r.cancelled) { state.progress[r.i] = { status: 'cancelled' }; continue }
           updatePlan(slug, { status: 'error', error: `Ação ${r.i}: ${r.error}` })
           break outer
         }
@@ -774,6 +804,7 @@ app.post('/api/talks/:slug/execute/stream', async (req, res) => {
     } else {
       const r = await runSingle(i, work)
       if (!r.ok) {
+        if (r.cancelled) { state.progress[i] = { status: 'cancelled' }; i++; continue }
         updatePlan(slug, { status: 'error', error: `Ação ${i}: ${r.error}` })
         break
       }
