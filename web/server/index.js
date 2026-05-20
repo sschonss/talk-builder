@@ -335,15 +335,18 @@ app.post('/api/settings', (req, res) => {
 
 app.get('/api/talks', (_req, res) => res.json({ talks: listTalks() }))
 
-app.post('/api/talks', (req, res) => {
+app.post('/api/talks', async (req, res) => {
   const { title } = req.body || {}
   if (!title) return res.status(400).json({ error: 'title obrigatório' })
   const slug = slugify(title)
   const dir = ensureTalkDir(slug)
   if (!fs.existsSync(path.join(dir, 'slides.json'))) {
+    const { pickThemeForTitle, getTheme } = await import('./themes.js')
+    const themeId = pickThemeForTitle(title)
+    const theme = getTheme(themeId)
     saveSlides(slug, {
       presentation: { title, subtitle: '', author: '', event: '' },
-      theme: { config: { colors: { background: '#000000', primary: '#FFFFFF', secondary: '#FF4013', text: '#FFFFFF' }, fonts: { heading: 'Inter', body: 'Inter', code: 'Menlo' } } },
+      theme: { id: themeId, config: theme.config },
       slides: [],
     })
   }
@@ -667,70 +670,122 @@ app.post('/api/talks/:slug/execute/stream', async (req, res) => {
 
   let work = JSON.parse(JSON.stringify(slides))
   let anyApplied = false
-  const { executeAction } = await import('./executor.js')
+  const { planActionLLM, applyAction, isParallelSafe } = await import('./executor.js')
 
   updatePlan(slug, { status: 'running', cancelled: false, error: null })
-  const startEv = { total: state.plan.actions.length, preamble: state.plan.preamble }
+  const startEv = { total: state.plan.actions.length, preamble: state.plan.preamble, concurrency: cfg.planner_concurrency || 1 }
   sseSend(res, 'start', startEv)
   emitPlanEvent(slug, 'start', startEv)
 
   let clientClosed = false
   res.on('close', () => { clientClosed = true })
 
-  for (let i = 0; i < state.plan.actions.length; i++) {
-    if (state.cancelled) {
-      sseSend(res, 'cancelled', { at: i })
-      emitPlanEvent(slug, 'cancelled', { at: i })
-      updatePlan(slug, { status: 'cancelled' })
-      break
-    }
+  const concurrency = Math.max(1, Math.min(8, cfg.planner_concurrency || 3))
+  const useCache = cfg.cache_enabled !== false
+
+  function emit(ev, data) {
+    if (!clientClosed) sseSend(res, ev, data)
+    emitPlanEvent(slug, ev, data)
+  }
+
+  async function runSingle(i, snapshot) {
     const action = state.plan.actions[i]
     const t0 = Date.now()
     state.currentIndex = i
-    const asEv = { i, action }
-    sseSend(res, 'action_start', asEv)
-    emitPlanEvent(slug, 'action_start', asEv)
-    state.progress[i] = { status: 'running', attempt: 1 }
+    emit('action_start', { i, action })
+    state.progress[i] = { status: 'running', attempt: 1, chunks: 0 }
     try {
-      const r = await executeAction({
-        slides: work,
-        action,
-        cfg,
-        onAttempt: (n) => {
-          const ev = { i, attempt: n }
-          if (!clientClosed) sseSend(res, 'action_attempt', ev)
-          emitPlanEvent(slug, 'action_attempt', ev)
-          state.progress[i].attempt = n
+      const r = await planActionLLM({
+        slides: snapshot, action, cfg, useCache,
+        onChunk: (text, meta) => {
+          state.progress[i].chunks = (state.progress[i].chunks || 0) + text.length
+          emit('action_chunk', { i, text: text.slice(0, 400), len: text.length, cached: !!meta?.cached })
         },
       })
       state.tokens.in += r.tokens_in || 0
       state.tokens.out += r.tokens_out || 0
       if (!r.ok) {
-        const ev = { i, error: r.error, raw: (r.raw || '').slice(0, 1000), retryable: true, tokens: state.tokens }
-        if (!clientClosed) sseSend(res, 'action_error', ev)
-        emitPlanEvent(slug, 'action_error', ev)
         state.progress[i] = { status: 'error', error: r.error, attempt: state.progress[i]?.attempt || 1 }
+        emit('action_error', { i, error: r.error, raw: (r.raw || '').slice(0, 1000), retryable: true, tokens: state.tokens })
+        return { ok: false, i, error: r.error }
+      }
+      return { ok: true, i, llmOutput: r.llmOutput, elapsed_ms: Date.now() - t0, tokens_in: r.tokens_in, tokens_out: r.tokens_out, cached: r.cached }
+    } catch (e) {
+      const msg = String(e.message || e)
+      state.progress[i] = { status: 'error', error: msg }
+      emit('action_error', { i, error: msg, retryable: true })
+      return { ok: false, i, error: msg }
+    }
+  }
+
+  let i = 0
+  outer: while (i < state.plan.actions.length) {
+    if (state.cancelled) {
+      emit('cancelled', { at: i })
+      updatePlan(slug, { status: 'cancelled' })
+      break
+    }
+    const action = state.plan.actions[i]
+
+    if (concurrency > 1 && isParallelSafe(action)) {
+      const batch = []
+      let j = i
+      while (j < state.plan.actions.length
+        && batch.length < concurrency
+        && isParallelSafe(state.plan.actions[j])) {
+        batch.push(j)
+        j++
+      }
+      const snapshot = JSON.parse(JSON.stringify(work))
+      const results = await Promise.all(batch.map(idx => runSingle(idx, snapshot)))
+
+      for (const r of results) {
+        if (!r.ok) {
+          updatePlan(slug, { status: 'error', error: `Ação ${r.i}: ${r.error}` })
+          break outer
+        }
+        try {
+          applyAction(state.plan.actions[r.i], work, r.llmOutput)
+          anyApplied = true
+          state.progress[r.i] = {
+            status: 'done', elapsed_ms: r.elapsed_ms,
+            tokens_in: r.tokens_in, tokens_out: r.tokens_out, cached: r.cached,
+            attempt: state.progress[r.i]?.attempt || 1,
+          }
+          emit('action_done', { i: r.i, elapsed_ms: r.elapsed_ms, tokens_in: r.tokens_in, tokens_out: r.tokens_out, cached: r.cached, tokens_total: state.tokens })
+        } catch (e) {
+          state.progress[r.i] = { status: 'error', error: e.message }
+          emit('action_error', { i: r.i, error: e.message, retryable: false })
+          updatePlan(slug, { status: 'error', error: e.message })
+          break outer
+        }
+      }
+      saveSlides(slug, work)
+      i = j
+    } else {
+      const r = await runSingle(i, work)
+      if (!r.ok) {
         updatePlan(slug, { status: 'error', error: `Ação ${i}: ${r.error}` })
         break
       }
-      work = r.slides
-      saveSlides(slug, work)
-      anyApplied = true
-      state.progress[i] = {
-        status: 'done', elapsed_ms: Date.now() - t0,
-        tokens_in: r.tokens_in, tokens_out: r.tokens_out,
-        attempt: state.progress[i]?.attempt || 1,
+      try {
+        if (r.llmOutput !== null) applyAction(action, work, r.llmOutput)
+        else applyAction(action, work, null)
+        anyApplied = true
+        state.progress[i] = {
+          status: 'done', elapsed_ms: r.elapsed_ms,
+          tokens_in: r.tokens_in, tokens_out: r.tokens_out, cached: r.cached,
+          attempt: state.progress[i]?.attempt || 1,
+        }
+        emit('action_done', { i, elapsed_ms: r.elapsed_ms, tokens_in: r.tokens_in, tokens_out: r.tokens_out, cached: r.cached, tokens_total: state.tokens })
+      } catch (e) {
+        state.progress[i] = { status: 'error', error: e.message }
+        emit('action_error', { i, error: e.message, retryable: false })
+        updatePlan(slug, { status: 'error', error: e.message })
+        break
       }
-      const adEv = { i, elapsed_ms: Date.now() - t0, tokens_in: r.tokens_in, tokens_out: r.tokens_out, tokens_total: state.tokens }
-      if (!clientClosed) sseSend(res, 'action_done', adEv)
-      emitPlanEvent(slug, 'action_done', adEv)
-    } catch (e) {
-      const ev = { i, error: String(e.message || e), retryable: true }
-      if (!clientClosed) sseSend(res, 'action_error', ev)
-      emitPlanEvent(slug, 'action_error', ev)
-      state.progress[i] = { status: 'error', error: String(e.message || e) }
-      updatePlan(slug, { status: 'error', error: String(e.message || e) })
-      break
+      saveSlides(slug, work)
+      i++
     }
   }
 
@@ -750,11 +805,61 @@ app.post('/api/talks/:slug/execute/stream', async (req, res) => {
   }
 
   const finalEv = { slides: work, slides_mtime, applied: anyApplied, status: state.status, tokens: state.tokens, error: state.error }
-  if (!clientClosed) sseSend(res, 'all_done', finalEv)
-  emitPlanEvent(slug, 'all_done', finalEv)
+  emit('all_done', finalEv)
 
   setTimeout(() => clearPlan(slug), 60_000)
   if (!clientClosed) res.end()
+})
+
+app.patch('/api/talks/:slug/plan', async (req, res) => {
+  const { getPlan, updatePlan } = await import('./plans.js')
+  const s = getPlan(req.params.slug)
+  if (!s) return res.status(404).json({ error: 'sem plano ativo' })
+  if (s.status === 'running') return res.status(409).json({ error: 'não dá pra editar durante execução' })
+  const { actions } = req.body || {}
+  if (!Array.isArray(actions)) return res.status(400).json({ error: 'actions[] obrigatório' })
+  const { validatePlan } = await import('./schemas.js')
+  const newPlan = { ...s.plan, actions }
+  const v = validatePlan(newPlan)
+  if (!v.ok) return res.status(422).json({ error: v.error })
+  s.plan = newPlan
+  s.progress = {}
+  updatePlan(req.params.slug, {})
+  const history = loadChat(req.params.slug)
+  if (s.msgIndex != null && history[s.msgIndex]?.kind === 'plan') {
+    history[s.msgIndex].plan = newPlan
+    history[s.msgIndex].progress = {}
+    saveChat(req.params.slug, history)
+  }
+  res.json({ plan: newPlan })
+})
+
+app.get('/api/themes', async (_req, res) => {
+  const { listThemes } = await import('./themes.js')
+  res.json({ themes: listThemes() })
+})
+
+app.post('/api/talks/:slug/theme', async (req, res) => {
+  const { slug } = req.params
+  const { id } = req.body || {}
+  const { getTheme } = await import('./themes.js')
+  const t = getTheme(id)
+  if (!t) return res.status(404).json({ error: 'tema não encontrado' })
+  const slides = loadSlides(slug)
+  if (!slides) return res.status(404).json({ error: 'talk não encontrada' })
+  slides.theme = { config: t.config }
+  saveSlides(slug, slides)
+  res.json({ ok: true, theme: t })
+})
+
+app.get('/api/cache/stats', async (_req, res) => {
+  const { cacheStats } = await import('./cache.js')
+  res.json(cacheStats())
+})
+
+app.post('/api/cache/clear', async (_req, res) => {
+  const { cacheClear } = await import('./cache.js')
+  res.json({ cleared: cacheClear() })
 })
 
 app.get('/api/talks/:slug/context-stats', async (req, res) => {
@@ -762,11 +867,14 @@ app.get('/api/talks/:slug/context-stats', async (req, res) => {
   const slides = loadSlides(slug)
   const chat = loadChat(slug)
   if (!slides) return res.status(404).json({ error: 'talk não encontrada' })
-  const { estimateTokens } = await import('./plans.js')
+  const cfg = loadConfig()
   const tk = (chars) => Math.ceil(chars / 4)
   const chatChars = chat.reduce((a, m) => a + String(m?.content || '').length, 0)
   const slidesJsonChars = JSON.stringify(slides).length
   const summaryChars = (slides.slides || []).reduce((a, s) => a + 40 + (s?.data?.title?.length || 0), 0)
+  const classicTok = tk(chatChars + slidesJsonChars)
+  const plannerTok = tk(summaryChars + Math.min(chatChars, 2400))
+  const threshold = cfg.autocompact_threshold_tokens || 8000
   res.json({
     chat_messages: chat.length,
     chat_chars: chatChars,
@@ -775,8 +883,10 @@ app.get('/api/talks/:slug/context-stats', async (req, res) => {
     slides_json_chars: slidesJsonChars,
     slides_json_tokens_est: tk(slidesJsonChars),
     summary_tokens_est: tk(summaryChars),
-    classic_prompt_tokens_est: tk(chatChars + slidesJsonChars),
-    planner_prompt_tokens_est: tk(summaryChars + Math.min(chatChars, 2400)),
+    classic_prompt_tokens_est: classicTok,
+    planner_prompt_tokens_est: plannerTok,
+    autocompact_threshold: threshold,
+    should_compact: tk(chatChars) > threshold,
   })
 })
 

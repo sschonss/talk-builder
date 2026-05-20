@@ -87,7 +87,11 @@ export async function planActions({ slides, userPrompt, chatHistory, similarCont
     similarContext,
   })
 
-  const reply = await runProvider(cfg.provider, prompt, cfg)
+  const provider = cfg.planner_provider || cfg.provider
+  const subCfg = { ...cfg, provider }
+  if (cfg.planner_model) subCfg[`${provider}_model`] = cfg.planner_model
+
+  const reply = await runProvider(provider, prompt, subCfg)
   const json = extractJson(reply)
   if (!json) return { ok: false, error: 'planner não devolveu JSON válido', raw: reply }
   const v = validatePlan(json)

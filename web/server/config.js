@@ -20,6 +20,11 @@ const DEFAULTS = {
   llm_timeout_minutes: 30,
   edit_mode: 'auto',
   planner_threshold: 30,
+  planner_provider: '',
+  planner_model: '',
+  planner_concurrency: 3,
+  cache_enabled: true,
+  autocompact_threshold_tokens: 8000,
 }
 
 export function loadConfig() {

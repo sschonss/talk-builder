@@ -1,6 +1,7 @@
-import { runProvider } from './providers.js'
+import { runProvider, streamProvider } from './providers.js'
 import { validateSlide, summarizeDeck } from './schemas.js'
 import { extractJson } from './planner.js'
+import { cacheGet, cacheSet } from './cache.js'
 import {
   applyEditSlide, applyAddSlides, applyRemoveSlide, applyMoveSlide,
   applySetMeta, applyReplaceSection, applyRegenerateSlide,
@@ -144,21 +145,54 @@ function applyAction(action, slides, llmOutput) {
 }
 
 const NO_LLM = new Set(['remove_slide', 'move_slide'])
+const INDEX_SHIFTING = new Set(['add_slides', 'remove_slide', 'move_slide', 'replace_section', 'bulk_edit'])
 
 function estTokens(text) {
   if (!text) return 0
   return Math.ceil(String(text).length / 4)
 }
 
-export async function executeAction({ slides, action, cfg, onAttempt }) {
+export function isParallelSafe(action) {
+  return !INDEX_SHIFTING.has(action.type)
+}
+
+async function callLLM(cfg, prompt, { onChunk, useCache = true } = {}) {
+  const model = cfg[`${cfg.provider}_model`] || ''
+  if (useCache) {
+    const hit = cacheGet(cfg.provider, model, prompt)
+    if (hit != null) {
+      if (onChunk) onChunk(hit, { cached: true })
+      return { reply: hit, cached: true }
+    }
+  }
+  let reply
+  if (onChunk) {
+    let acc = ''
+    const gen = streamProvider(cfg.provider, prompt, cfg)
+    for await (const chunk of gen) {
+      if (typeof chunk === 'string') {
+        acc += chunk
+        onChunk(chunk, { cached: false })
+      }
+    }
+    reply = acc
+  } else {
+    reply = await runProvider(cfg.provider, prompt, cfg)
+  }
+  if (useCache && reply) cacheSet(cfg.provider, model, prompt, reply)
+  return { reply, cached: false }
+}
+
+export async function executeAction({ slides, action, cfg, onAttempt, onChunk, useCache = true }) {
   if (NO_LLM.has(action.type)) {
     applyAction(action, slides, null)
-    return { ok: true, slides, llm_text: null, tokens_in: 0, tokens_out: 0 }
+    return { ok: true, slides, llm_text: null, tokens_in: 0, tokens_out: 0, cached: false }
   }
 
   let lastError = null
   let lastRaw = null
   let prompt = ''
+  let cachedAny = false
   for (let attempt = 1; attempt <= 2; attempt++) {
     if (onAttempt) onAttempt(attempt)
     prompt = buildPromptForAction(action, slides)
@@ -166,15 +200,58 @@ export async function executeAction({ slides, action, cfg, onAttempt }) {
       prompt += `\n\nSua tentativa anterior falhou com este erro:\n${lastError}\n\nRaw output anterior (primeiros 800 chars):\n${(lastRaw || '').slice(0, 800)}\n\nCorrija o JSON e tente de novo.`
     }
     try {
-      const reply = await runProvider(cfg.provider, prompt, cfg)
+      const { reply, cached } = await callLLM(cfg, prompt, { onChunk, useCache })
+      cachedAny = cachedAny || cached
       lastRaw = reply
       const json = extractJson(reply)
       if (!json) { lastError = 'LLM não devolveu JSON válido'; continue }
       applyAction(action, slides, json)
-      return { ok: true, slides, llm_text: reply, tokens_in: estTokens(prompt), tokens_out: estTokens(reply) }
+      return {
+        ok: true, slides, llm_text: reply,
+        tokens_in: estTokens(prompt), tokens_out: estTokens(reply),
+        cached: cachedAny,
+      }
     } catch (e) {
       lastError = e.message
     }
   }
-  return { ok: false, error: lastError, raw: lastRaw, tokens_in: estTokens(prompt), tokens_out: estTokens(lastRaw) }
+  return {
+    ok: false, error: lastError, raw: lastRaw,
+    tokens_in: estTokens(prompt), tokens_out: estTokens(lastRaw), cached: cachedAny,
+  }
 }
+
+export async function planActionLLM({ slides, action, cfg, onChunk, useCache = true }) {
+  if (NO_LLM.has(action.type)) {
+    return { ok: true, llmOutput: null, tokens_in: 0, tokens_out: 0, cached: false }
+  }
+  let lastError = null
+  let lastRaw = null
+  let prompt = ''
+  let cachedAny = false
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    prompt = buildPromptForAction(action, slides)
+    if (attempt > 1 && lastError) {
+      prompt += `\n\nSua tentativa anterior falhou com este erro:\n${lastError}\n\nRaw output anterior (primeiros 800 chars):\n${(lastRaw || '').slice(0, 800)}\n\nCorrija o JSON e tente de novo.`
+    }
+    try {
+      const { reply, cached } = await callLLM(cfg, prompt, { onChunk, useCache })
+      cachedAny = cachedAny || cached
+      lastRaw = reply
+      const json = extractJson(reply)
+      if (!json) { lastError = 'LLM não devolveu JSON válido'; continue }
+      return {
+        ok: true, llmOutput: json, raw: reply,
+        tokens_in: estTokens(prompt), tokens_out: estTokens(reply), cached: cachedAny,
+      }
+    } catch (e) {
+      lastError = e.message
+    }
+  }
+  return {
+    ok: false, error: lastError, raw: lastRaw,
+    tokens_in: estTokens(prompt), tokens_out: estTokens(lastRaw), cached: cachedAny,
+  }
+}
+
+export { applyAction }
