@@ -276,9 +276,17 @@ def t_comparison(s, d):
     accent_bar(s, Inches(0.8), Inches(0.8))
     text(s, Inches(0.8), Inches(0.95), Inches(11.7), Inches(1.0),
          d.get("title",""), size=34, bold=True, color=PRIMARY, font=FONT_H)
-    # Support both flat (left_title/left_items) and nested (left: {title, bullets}) schemas
-    left  = d.get("left")  or {}
-    right = d.get("right") or {}
+    def _coerce(v):
+        if isinstance(v, dict): return v
+        if isinstance(v, str):
+            items = [ln.lstrip('-*•').strip() for ln in v.splitlines() if ln.strip().startswith(('-','*','•'))]
+            if not items: items = [ln.strip() for ln in v.splitlines() if ln.strip()]
+            return {"title": "", "items": items}
+        if isinstance(v, list):
+            return {"title": "", "items": [str(x) for x in v]}
+        return {}
+    left  = _coerce(d.get("left"))
+    right = _coerce(d.get("right"))
     left_title  = d.get("left_title")  or left.get("title", "")
     right_title = d.get("right_title") or right.get("title", "")
     left_items  = d.get("left_items")  or left.get("bullets")  or left.get("items")  or []
