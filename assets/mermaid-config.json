@@ -1,0 +1,15 @@
+{
+  "theme": "dark",
+  "themeVariables": {
+    "background": "#000000",
+    "primaryColor": "#1a1a1a",
+    "primaryTextColor": "#ffffff",
+    "primaryBorderColor": "#ff4013",
+    "lineColor": "#ff4013",
+    "secondaryColor": "#262626",
+    "tertiaryColor": "#0d0d0d",
+    "fontFamily": "Inter, Helvetica, Arial, sans-serif"
+  },
+  "flowchart": { "htmlLabels": true, "curve": "basis" },
+  "sequence": { "actorMargin": 80 }
+}

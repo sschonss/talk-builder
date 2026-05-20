@@ -1,0 +1,59 @@
+{
+  "presentation": {
+    "title": "Minha Talk de Exemplo",
+    "author": "Luiz Schons",
+    "event": "Demo"
+  },
+  "slides": [
+    {
+      "order": 0,
+      "template": "cover",
+      "data": {
+        "title": "Talk de Exemplo",
+        "subtitle": "Mostrando o talk-builder",
+        "author": "Luiz Schons",
+        "event": "Demo · 2026"
+      }
+    },
+    {
+      "order": 1,
+      "template": "agenda",
+      "data": {
+        "title": "Pauta",
+        "items": ["Intro", "Conceito", "Exemplo", "Q&A"]
+      }
+    },
+    {
+      "order": 2,
+      "template": "question",
+      "data": { "question": "Por que isso importa?" }
+    },
+    {
+      "order": 3,
+      "template": "content",
+      "data": {
+        "title": "Conceito principal",
+        "bullets": [
+          "Primeiro ponto importante",
+          "Segundo ponto que reforça",
+          "Terceiro ponto com exemplo concreto"
+        ],
+        "quote": "A simplicidade é a sofisticação máxima."
+      }
+    },
+    {
+      "order": 4,
+      "template": "diagram",
+      "data": {
+        "title": "Como funciona",
+        "caption": "Fluxo do client até o serviço",
+        "mermaid_code": "graph LR\n  A[Client] --> B[API]\n  B --> C[Service]\n  C --> D[(Database)]"
+      }
+    },
+    {
+      "order": 5,
+      "template": "closing",
+      "data": { "text": "Obrigado!" }
+    }
+  ]
+}

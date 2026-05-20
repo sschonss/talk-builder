@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.vscode/
+.idea/
+output/
+*.pptx
+.cache/
+web/node_modules/
